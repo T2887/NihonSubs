@@ -113,6 +113,11 @@ else
     TASKSET="taskset $(printf '%X' "$CPU_MASK")"
 fi
 
+# 推理进程降一级 nice：2 线程绑大核已经避免了抢满 CPU，但系统进程（system_server）
+# 还需要预留余量——2026-11-11 实测整机 ANR 是系统侧先倒，留点余量能少犯。
+NICE="nice -n 10"
+command -v nice > /dev/null 2>&1 || NICE=""
+
 IN="$1"
 if [ -z "$IN" ]; then
     echo "用法: sh $0 <输入媒体文件> [输出.srt]"
@@ -162,7 +167,9 @@ ZIP_READY=0
 SV_DIR=""
 SV_READY=0
 SV_TOKENS=""
-for d in "$W/models" "$W" \
+# 第一优先：App 传进来的私有目录（/data/user/0/com.nihonsubs/files/models）。
+# 2026-11-11 加固：模型别放 /sdcard（FUSE），llama mmap 1.1 GB 模型时缺页会把系统拖垮。
+for d in $ASMR_MODEL "$W/models" "$W" \
          /sdcard/Android/data/com.nihonsubs/files/models \
          /storage/emulated/0/Android/data/com.nihonsubs/files/models \
          /storage/emulated/0/Download/asmr-models; do
@@ -182,7 +189,7 @@ for d in "$W/models" "$W" \
 done
 if [ -z "$MODEL_DIR" ]; then
     echo "[错误] 找不到模型（必须有 hy.gguf）"
-    echo "[错误] 请放到：/sdcard/Android/data/com.nihonsubs/files/models/"
+    echo "[错误] 请用 App 里的「导入模型」按钮选 asmr-models.zip"
     exit 1
 fi
 if [ "$ZIP_READY" -eq 1 ] && [ "$SV_READY" -eq 1 ] && [ -n "$SV_TOKENS" ]; then
@@ -196,7 +203,7 @@ elif [ "$SV_READY" -eq 1 ]; then
     [ -n "$ASR_NAME" ] || ASR_NAME="SenseVoice int8"
 else
     echo "[错误] 没有任何识别模型（需要 zipformer-ja/ 或 model.int8.onnx + tokens.txt）"
-    echo "[错误] 请放到：/sdcard/Android/data/com.nihonsubs/files/models/"
+    echo "[错误] 请用 App 里的「导入模型」按钮选 asmr-models.zip"
     exit 1
 fi
 
@@ -262,7 +269,7 @@ server_alive() {
 start_llama() {
     cd "$LLAMA_DIR" || exit 1
     rm -f "$LLAMA_DIR/llama.log"
-    nohup $TASKSET "$BIN_LLAMA" --model "$MODEL_DIR/hy.gguf" \
+    nohup $NICE $TASKSET "$BIN_LLAMA" --model "$MODEL_DIR/hy.gguf" \
         --host 127.0.0.1 --port $PORT -c 4096 -np 1 \
         --no-webui --metrics -t $THREADS \
         > "$LLAMA_DIR/llama.log" 2>&1 < /dev/null &
@@ -396,7 +403,7 @@ recognize() {
             # 否则空窗之后的句子段号会错位一格。
             echo "#SEG_OFFSET $IDX" >> "$dest"
             if [ "$kind" = "zipformer" ]; then
-                LD_LIBRARY_PATH="$D" $TASKSET "$BIN_SHERPA" \
+                LD_LIBRARY_PATH="$D" $NICE $TASKSET "$BIN_SHERPA" \
                     --model-type=transducer \
                     --tokens="$ZIP_DIR/tokens.txt" \
                     --encoder="$ZIP_DIR/encoder.int8.onnx" \
@@ -405,7 +412,7 @@ recognize() {
                     --num-threads=$THREADS \
                     $chunk >> "$dest" 2>> "$W/asr.err"
             else
-                LD_LIBRARY_PATH="$D" $TASKSET "$BIN_SHERPA" \
+                LD_LIBRARY_PATH="$D" $NICE $TASKSET "$BIN_SHERPA" \
                     --sense-voice-model="$SV_DIR/model.int8.onnx" \
                     --tokens="$SV_TOKENS" \
                     --sense-voice-language=ja \
@@ -447,7 +454,7 @@ if [ "$ASR_KIND" = "fused" ]; then
             [ -f "$F" ] || continue
             # 单窗单标记：段号 = 哑窗号，绝对时间才正确
             echo "#SEG_OFFSET $WN" >> "$SV_TXT"
-            LD_LIBRARY_PATH="$D" $TASKSET "$BIN_SHERPA" \
+            LD_LIBRARY_PATH="$D" $NICE $TASKSET "$BIN_SHERPA" \
                 --sense-voice-model="$SV_DIR/model.int8.onnx" \
                 --tokens="$SV_TOKENS" \
                 --sense-voice-language=ja \

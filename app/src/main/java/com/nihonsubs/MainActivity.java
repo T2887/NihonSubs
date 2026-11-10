@@ -122,6 +122,8 @@ public class MainActivity extends Activity {
     private android.app.AlertDialog modelDialog = null;
     /** 正在导入模型（解压/拷贝）时不再弹下载引导。 */
     private volatile boolean importingModels = false;
+    /** 正在把模型从 /sdcard 搬到私有目录（搬的时候别让用户点开始，会报缺模型）。 */
+    private volatile boolean migratingModels = false;
     private int curIdx = 0;
     private float fileProgress = 0f;
     private volatile boolean stopping = false;
@@ -274,6 +276,8 @@ public class MainActivity extends Activity {
         }
         setContentView(buildUi());
         scanInputDir();
+        // 老版本模型在 /sdcard（FUSE），后台搬到私有目录；只搬一次。
+        new Thread(this::migrateModelsIfNeeded, "model-migrate").start();
         // 启动后自动检查一次更新（静默，仅在有新版本时提示）
         ui.postDelayed(() -> checkForUpdate(false), 2000);
         ui.postDelayed(this::ensureAllFilesAccess, 1200);
@@ -988,10 +992,11 @@ public class MainActivity extends Activity {
         // 路径写成相对形式：完整路径太长，窄屏上会被折行，反而不好认
         String txt =
                 "【第一次用】\n"
-                + "模型放进 models 目录（两个必装）：\n"
+                + "模型由 App 自己保管（两个必装，导入一次即可）：\n"
                 + "　· model.int8.onnx（语音识别，约 230 MB）\n"
                 + "　· hy.gguf（日语→中文翻译，约 1.1 GB）\n"
-                + "点「导入模型」可以选单个文件，也可以选打包好的 zip。\n\n"
+                + "点「导入模型」选打包好的 zip 最省事，也可以一个个选文件。\n"
+                + "（模型存在 App 私有目录，不用手动放、也不会被清理软件删）\n\n"
                 + "【放片子】\n"
                 + "点「添加文件」选视频或音频（mp4 / mkv / wmv / mp3 / wav 都行），\n"
                 + "或者用数据线拷进 input 目录，重开 App 会自动扫出来。\n\n"
@@ -1010,7 +1015,8 @@ public class MainActivity extends Activity {
                 + "　<原文件名>.chs.srt　（播放器外挂字幕）\n"
                 + "　<原文件名>.chs.lrc　（音乐播放器逐行歌词）\n"
                 + "和视频放一起，用播放器加载就能看。\n"
-                + "（App 自己的目录都在 Android/data/com.nihonsubs/files 下）\n\n"
+                + "（字幕/输入目录在 Android/data/com.nihonsubs/files 下；\n"
+                + "　模型在 App 私有目录，不用手管）\n\n"
                 + "【耗时参考】\n"
                 + "90 秒的片子约 31 秒；16 分钟约 6~7 分钟；91 分钟约 12 分钟。\n"
                 + "全程离线，不联网。\n\n"
@@ -1393,11 +1399,73 @@ public class MainActivity extends Activity {
         return d;
     }
 
+    /**
+     * 模型目录：私有目录 /data/user/0/com.nihonsubs/files/models。
+     * 为什么不用 /sdcard/Android/data/.../models：
+     *   1) 那里是 FUSE 用户态文件系统，llama 用 mmap 加载 1.1 GB gguf 时缺页
+     *      要绕一大圈，实测把 loadavg 顶到 100+，系统进程先 ANR（2026-11-11 事故）；
+     *   2) 外部目录会被系统扫描、被清理软件删，私有目录不会。
+     * 空间够（用户机 /data 剩 93 GB），所以主体模型搬进来。
+     */
     private File modelDir() {
-        // app 自己的外部目录：/sdcard/Android/data/com.nihonsubs/files/models
-        File d = new File(getExternalFilesDir(null), "models");
-        d.mkdirs();
+        File d = new File(getFilesDir(), "models");
+        if (!d.isDirectory()) d.mkdirs();
         return d;
+    }
+
+    /** 老版本的模型目录（外部存储），只用于一次性搬迁。 */
+    private File legacyModelDir() {
+        File ext = getExternalFilesDir(null);
+        return ext == null ? null : new File(ext, "models");
+    }
+
+    /**
+     * 一次性搬迁：把老版本放在 /sdcard 的模型文件移到私有目录，移完删源文件腾空间。
+     * 在后台线程跑，失败也不影响旧目录继续用（run.sh 两边都会找）。
+     */
+    private void migrateModelsIfNeeded() {
+        final File dst = modelDir();
+        final File old = legacyModelDir();
+        if (old == null || !old.isDirectory()) return;
+        final String[] names = {"hy.gguf", "model.int8.onnx",
+                "zipformer-ja/encoder.int8.onnx", "zipformer-ja/decoder.onnx",
+                "zipformer-ja/joiner.onnx", "zipformer-ja/tokens.txt"};
+        java.util.List<String> todo = new java.util.ArrayList<>();
+        for (String n : names) {
+            if (new File(old, n).isFile() && !new File(dst, n).isFile()) todo.add(n);
+        }
+        if (todo.isEmpty()) return;
+        migratingModels = true;
+        try {
+            ui.post(() -> appendLog("[模型] 正在把模型搬到应用私有目录（一次性，之后加载更快）…"));
+            for (String n : todo) {
+                File s = new File(old, n);
+                File t = new File(dst, n);
+                File parent = t.getParentFile();
+                if (parent != null && !parent.isDirectory()) parent.mkdirs();
+                copyFile(s, t);
+                if (t.length() == s.length()) s.delete();
+            }
+            new File(old, "zipformer-ja").delete();
+            old.delete();
+            ui.post(() -> {
+                appendLog("[模型] 搬迁完成：" + dst.getAbsolutePath());
+                refreshModelRow();
+            });
+        } catch (Exception e) {
+            ui.post(() -> appendLog("[模型] 搬迁失败（旧目录仍可用）：" + e));
+        } finally {
+            migratingModels = false;
+        }
+    }
+
+    private void copyFile(File src, File dst) throws java.io.IOException {
+        try (InputStream in = new FileInputStream(src);
+             OutputStream out = new FileOutputStream(dst)) {
+            byte[] buf = new byte[1 << 20];
+            int n;
+            while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
+        }
     }
 
     /** 把 assets 里的可执行文件与运行库解压到私有目录（只需一次）。 */
@@ -1420,7 +1488,7 @@ public class MainActivity extends Activity {
     }
 
     /** assets 里的 run.sh 有改动时 +1，老设备靠这个戳记重新解压。 */
-    private static final String ASSETS_VER = "v8";
+    private static final String ASSETS_VER = "v9";
 
     private boolean binReady() {
         return new File(binDir(), ".assets_" + ASSETS_VER).isFile()
@@ -1434,6 +1502,10 @@ public class MainActivity extends Activity {
         if (busy) return;
         if (picked.isEmpty()) {
             appendLog("[提示] 先添加要处理的视频或音频");
+            return;
+        }
+        if (migratingModels) {
+            appendLog("[提示] 正在搬迁模型文件，几秒后就能开始，请稍等再点一次。");
             return;
         }
         File md = modelDir();
@@ -1779,6 +1851,8 @@ public class MainActivity extends Activity {
                 pb.environment().put("LD_LIBRARY_PATH", getApplicationInfo().nativeLibraryDir);
                 pb.environment().put("ASMR_LIB", getApplicationInfo().nativeLibraryDir);
                 pb.environment().put("ASMR_WORK", bin.getAbsolutePath());
+                // 模型在私有目录（run.sh 优先用它，找不到才回落到 /sdcard）
+                pb.environment().put("ASMR_MODEL", modelDir().getAbsolutePath());
                 running = pb.start();
                 try (BufferedReader r = new BufferedReader(
                         new InputStreamReader(running.getInputStream()))) {

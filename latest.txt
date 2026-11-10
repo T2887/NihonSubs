@@ -2,8 +2,8 @@
 # 格式：VERSION=<语义版本号> APK=<下载地址> NOTE=<更新说明（可空）>
 # MODEL_URL=<模型包下载页；缺模型时 App 弹窗「去下载」打开它。换网盘只改这一行，不必重打包>
 # MODEL_CODE=<网盘提取码（可空）；有值时弹窗会显示并复制到剪贴板>
-VERSION=1.1.6
-APK=https://github.com/T2887/NihonSubs/releases/download/v1.1.6/NihonSubs-v1.1.6.apk
+VERSION=1.1.7
+APK=https://github.com/T2887/NihonSubs/releases/download/v1.1.7/NihonSubs-v1.1.7.apk
 MODEL_URL=https://pan.quark.cn/s/42530f352af0
 MODEL_CODE=GHXq
-NOTE=v1.1.6：字幕默认存到原片所在文件夹（例 Download/xxx.wav → Download/xxx.chs.srt + xxx.chs.lrc，需「所有文件访问」权限）；新增整屏队列页——屏幕从左往右划或点「文件列表」右上角「队列」打开，可上下滑动，点一下或长按选中，选中后往左划移除，空白处左右划一下收起队列页。备用百度网盘 https://pan.baidu.com/s/1UrvC4AaxsV-BBJWOrTNUdg?pwd=c82t 提取码 c82t。
+NOTE=v1.1.7：模型改存 App 私有目录（不再放 /sdcard），避免 mmap 加载 1.1 GB 模型时把整机拖到 ANR；老用户首次启动自动搬迁一次，搬完删除旧文件。修复导入后队列/模型状态偶发不同步。备用百度网盘 https://pan.baidu.com/s/1UrvC4AaxsV-BBJWOrTNUdg?pwd=c82t 提取码 c82t。

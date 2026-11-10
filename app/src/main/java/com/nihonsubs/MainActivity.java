@@ -512,9 +512,13 @@ public class MainActivity extends Activity {
         // 路径写成相对形式：完整路径太长，窄屏上会被折行，反而不好认
         String txt =
                 "【第一次用】\n"
-                + "把两个模型文件放进 models 目录：\n"
-                + "　· model.int8.onnx（230 MB，语音识别）\n"
-                + "　· hy.gguf（1.1 GB，日语→中文翻译）\n"
+                + "模型放进 models 目录（翻译模型 hy.gguf 必需）：\n"
+                + "　· hy.gguf（翻译，必需）\n"
+                + "　· zipformer-ja/（主识别，推荐）\n"
+                + "　　encoder / decoder / joiner / tokens.txt\n"
+                + "　· model.int8.onnx（备用识别，可选）\n"
+                + "识别模型至少放一种：只放 zipformer 走单车道，\n"
+                + "两个识别都放则自动双车道融合（准且省电）。\n"
                 + "点「导入模型」可以选单个文件，也可以选打包好的 zip。\n\n"
                 + "【放片子】\n"
                 + "点「添加文件」选视频或音频（mp4 / mkv / wmv / mp3 / wav 都行），\n"

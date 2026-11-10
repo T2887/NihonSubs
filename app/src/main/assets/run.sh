@@ -1,8 +1,8 @@
 #!/system/bin/sh
-# 手机端一键字幕：媒体文件 -> 16k wav -> 切段 + SenseVoice -> Hy-MT2 翻译 -> SRT
+# 手机端一键字幕：媒体文件 -> 16k wav -> 切段 + SenseVoice -> Hy-MT2 翻译 -> SRT+LRC
 #
 # 用法（在手机上）：
-#     sh run.sh <输入文件> [输出.srt]
+#     sh run.sh <输入文件> [输出.srt]（产物成对：<同名>.chs.srt 与 <同名>.chs.lrc）
 #
 # 依赖（可执行文件在 nativeLibraryDir 里，改名成 libXXX.so 才能 exec）：
 #     libffmpeg.so  libsherpaoffline.so  libasmrmobile.so  libllamaserver.so
@@ -490,4 +490,4 @@ rm -rf "$SEGDIR" "$ZIP_TXT" "$SV_TXT" "$DUMB_LIST"
 if [ -n "$WAV" ] && [ "$WAV" != "$IN" ]; then rm -f "$WAV"; fi
 rm -f "$TXT"
 t_end=$(date +%s)
-echo "==== 完成：$OUT（总耗时 $((t_end - t_start)) 秒）===="
+echo "==== 完成：$OUT + ${OUT%.srt}.lrc（总耗时 $((t_end - t_start)) 秒）===="

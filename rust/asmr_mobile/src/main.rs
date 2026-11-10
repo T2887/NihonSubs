@@ -623,6 +623,26 @@ fn fmt_ts(sec: f64) -> String {
     format!("{h:02}:{m:02}:{s:02},{ms:03}")
 }
 
+/// LRC 时间戳：[mm:ss.xx]（分钟:秒.百分秒）。LRC 给音乐播放器逐行同步歌词。
+fn fmt_lrc_ts(sec: f64) -> String {
+    let total_ms = (sec.max(0.0) * 1000.0).round() as u64;
+    let m = total_ms / 60_000;
+    let s = (total_ms % 60_000) / 1000;
+    let cs = (total_ms % 1000) / 10;
+    format!("{m:02}:{s:02}.{cs:02}")
+}
+
+/// 从 SRT 输出路径推导 LRC 路径：最后一段后缀换成 .chs.lrc（无 .chs 时 .lrc）。
+fn lrc_out_path(srt_path: &str) -> String {
+    if let Some(stem) = srt_path.strip_suffix(".chs.srt") {
+        format!("{stem}.chs.lrc")
+    } else if let Some(stem) = srt_path.strip_suffix(".srt") {
+        format!("{stem}.chs.lrc")
+    } else {
+        format!("{srt_path}.lrc")
+    }
+}
+
 /// 对 127.0.0.1:port 发一次 /v1/chat/completions，返回 content。
 fn translate(port: u16, text: &str, temp: f64) -> Result<String, String> {
     let body = json!({
@@ -883,6 +903,7 @@ fn main() {
 
     let t0 = Instant::now();
     let mut srt = String::new();
+    let mut lrc = String::new();
     let mut failed = 0usize;
     for (n, s) in segs.iter().enumerate() {
         let zh = if do_translate {
@@ -908,10 +929,18 @@ fn main() {
             fmt_ts(s.end),
             zh
         ));
+        // LRC 逐行同步歌词（给音乐播放器）：[mm:ss.xx]中文
+        lrc.push_str(&format!("[{}]{}\n", fmt_lrc_ts(s.start), zh));
     }
 
     if let Err(e) = fs::write(&output, srt) {
         eprintln!("[错误] 写 {output} 失败: {e}");
+        exit(1);
+    }
+    // 顺带写一份 LRC 逐行同步歌词（给音乐播放器），和 SRT 同一条目同时间轴。
+    let out_lrc = lrc_out_path(&output);
+    if let Err(e) = fs::write(&out_lrc, &lrc) {
+        eprintln!("[错误] 写 {out_lrc} 失败: {e}");
         exit(1);
     }
     let el = t0.elapsed().as_secs_f64();

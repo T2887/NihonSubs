@@ -110,6 +110,9 @@ public class MainActivity extends Activity {
     private String remoteModelUrl = null;
     /** 网盘提取码（latest.txt 里的 MODEL_CODE，可空） */
     private String remoteModelCode = null;
+    /** zipformer-ja 可选增强的四个文件名。 */
+    private static final String[] ZIPF_FILES =
+            {"encoder.int8.onnx", "decoder.onnx", "joiner.onnx", "tokens.txt"};
     private int curIdx = 0;
     private float fileProgress = 0f;
     private volatile boolean stopping = false;
@@ -656,11 +659,21 @@ public class MainActivity extends Activity {
         boolean gguf = new File(md, "hy.gguf").isFile();
 
         if (onnx && gguf) {
-            modelStateView.setText("模型已导入");
+            int zf = countZipformer();
+            long onnxMb = new File(md, "model.int8.onnx").length() / (1024 * 1024);
+            if (onnxMb > 500) {
+                // 常见事故：把 hy.gguf 选成了 model.int8.onnx
+                modelStateView.setText("识别模型异常（" + onnxMb + " MB，应为约 230 MB），请重新导入");
+            } else {
+                modelStateView.setText(zf == ZIPF_FILES.length
+                        ? "模型已导入（含 zipformer-ja 增强）"
+                        : "模型已导入（可加装 zipformer-ja）");
+            }
             modelStateView.setTextColor(OK_GREEN);
             modelBtn.setText("已导入");
-            modelBtn.setEnabled(false);
-            modelBtn.setAlpha(0.4f);
+            // 保持可点：用户可能还要补装 zipformer-ja 或重新导入
+            modelBtn.setEnabled(true);
+            modelBtn.setAlpha(1f);
         } else {
             if (!onnx && !gguf) {
                 modelStateView.setText("未检测到模型");
@@ -931,8 +944,16 @@ public class MainActivity extends Activity {
 
     // ── 模型导入（SAF 文件选择器）────────────────────────
     private void startModelImport() {
-        pendingModelName = "model.int8.onnx";
+        appendLog("[模型] 请选择 asmr-models.zip（推荐，一次装齐）；也可单独选 model.int8.onnx、hy.gguf 或 zipformer-ja 里的文件");
         pickModelFile();
+    }
+
+    /** 数一下 zipformer-ja 已经装齐几个文件。 */
+    private int countZipformer() {
+        File zd = new File(modelDir(), "zipformer-ja");
+        int n = 0;
+        for (String name : ZIPF_FILES) if (new File(zd, name).isFile()) n++;
+        return n;
     }
 
     private void pickModelFile() {
@@ -1024,17 +1045,45 @@ public class MainActivity extends Activity {
         });
     }
 
+    /**
+     * 导入单个模型文件：按**用户实际选中的文件名**决定存到哪儿，不再依赖先选谁。
+     * 这样顺序随便（先 hy.gguf 也行），zipformer-ja 的 4 个文件也能一个个补进来。
+     */
     private void copyModel(final Uri uri) {
         String display = displayName(uri);
-        if (display != null && display.toLowerCase().endsWith(".zip")) {
+        String lower = display == null ? "" : display.toLowerCase(java.util.Locale.ROOT);
+        if (lower.endsWith(".zip")) {
             unzipModels(uri);
             return;
         }
-        final String name = pendingModelName;
-        if (name == null) return;
-        final File dst = new File(modelDir(), name);
-        appendLog("[模型] 正在导入 " + name + " …");
-        setStage("当前阶段　导入模型");
+        final String target;      // 落盘用的文件名
+        final boolean zipf;       // 是否放进 zipformer-ja/
+        if (lower.endsWith("model.int8.onnx")) {
+            target = "model.int8.onnx"; zipf = false;
+        } else if (lower.endsWith(".gguf")) {
+            target = "hy.gguf"; zipf = false;
+        } else if (lower.endsWith("encoder.int8.onnx")) {
+            target = "encoder.int8.onnx"; zipf = true;
+        } else if (lower.endsWith("decoder.onnx")) {
+            target = "decoder.onnx"; zipf = true;
+        } else if (lower.endsWith("joiner.onnx")) {
+            target = "joiner.onnx"; zipf = true;
+        } else if (lower.endsWith("tokens.txt")) {
+            target = "tokens.txt"; zipf = true;
+        } else {
+            appendLog("[模型] 不认识这个文件：" + display);
+            appendLog("[模型] 请选 asmr-models.zip，或 model.int8.onnx / hy.gguf（也可以是 zipformer-ja 里的文件）");
+            return;
+        }
+        final File dir = zipf ? new File(modelDir(), "zipformer-ja") : modelDir();
+        if (zipf && !dir.isDirectory() && !dir.mkdirs() && !dir.isDirectory()) {
+            appendLog("[模型] 无法创建 zipformer-ja 目录");
+            return;
+        }
+        final File dst = new File(dir, target);
+        final String shown = (zipf ? "zipformer-ja/" : "") + target;
+        appendLog("[模型] 正在导入 " + shown + " …");
+        ui.post(() -> setStage("当前阶段　导入模型"));
         long total = 0;
         try (InputStream in = getContentResolver().openInputStream(uri);
              OutputStream out = new FileOutputStream(dst)) {
@@ -1058,21 +1107,31 @@ public class MainActivity extends Activity {
             return;
         }
         final long mb = total / (1024 * 1024);
-        appendLog("[模型] 完成：" + name + "，" + mb + " MB");
-        ui.post(this::refreshModelRow);
-        if ("model.int8.onnx".equals(name)) {
-            pendingModelName = "hy.gguf";
-            ui.post(() -> {
-                appendLog("[模型] 接下来选 hy.gguf（约 1.1 GB）");
-                pickModelFile();
-            });
-        } else {
-            pendingModelName = null;
-            ui.post(() -> {
-                appendLog("[模型] 两个文件都就位了，再点一次「开始处理」");
-                setStage("当前阶段　就绪");
-            });
+        appendLog("[模型] 完成：" + shown + "，" + mb + " MB");
+        // 体积校验：防止把 hy.gguf 当成 model.int8.onnx 存进去（以前会静默写错）
+        if ("model.int8.onnx".equals(target) && mb > 500) {
+            appendLog("[警告] model.int8.onnx 正常约 230 MB，这个文件 " + mb + " MB —— 是不是选成 hy.gguf 了？");
         }
+        if ("hy.gguf".equals(target) && mb < 300) {
+            appendLog("[警告] hy.gguf 正常约 1080 MB，这个文件只有 " + mb + " MB，可能选错了");
+        }
+        ui.post(this::refreshModelRow);
+        final File md2 = modelDir();
+        ui.post(() -> {
+            boolean onnx = new File(md2, "model.int8.onnx").isFile();
+            boolean gguf = new File(md2, "hy.gguf").isFile();
+            if (onnx && gguf) {
+                if (countZipformer() == ZIPF_FILES.length) {
+                    appendLog("[模型] 基础模型与 zipformer-ja 都已就位，点「开始处理」即可");
+                } else {
+                    appendLog("[模型] 基础模型已就位。想更准可再导入 asmr-models.zip 补装 zipformer-ja（可选）");
+                }
+                setStage("当前阶段　就绪");
+            } else {
+                appendLog("[模型] 还缺 " + (!onnx ? "model.int8.onnx" : "hy.gguf") + "，点「导入模型」继续选下一个");
+                setStage("当前阶段　等待模型");
+            }
+        });
     }
 
     private void stop() {
@@ -1589,6 +1648,12 @@ public class MainActivity extends Activity {
 
     /** 「缺模型」引导：弹窗让用户去下载页取 asmr-models.zip（地址来自 latest.txt 的 MODEL_URL）。 */
     private void promptModelDownload() {
+        // 基础模型已在位：这个按钮改成「补装 / 重新导入」入口，而不是只弹下载页
+        File md0 = modelDir();
+        if (new File(md0, "model.int8.onnx").isFile() && new File(md0, "hy.gguf").isFile()) {
+            showModelReadyDialog();
+            return;
+        }
         if (remoteModelUrl != null && !remoteModelUrl.isEmpty()) {
             showModelDlDialog(remoteModelUrl);
             return;
@@ -1651,6 +1716,29 @@ public class MainActivity extends Activity {
         });
         b.setNeutralButton("已下载，去导入", (d, w) -> { d.dismiss(); startModelImport(); });
         b.setNegativeButton("取消", (d, w) -> d.dismiss());
+        try { b.show(); } catch (Exception ignored) { }
+    }
+
+    /** 模型已在位时的入口：补装 zipformer-ja / 重新导入 / 打开下载页。 */
+    private void showModelReadyDialog() {
+        final int zf = countZipformer();
+        android.app.AlertDialog.Builder b = new android.app.AlertDialog.Builder(this);
+        b.setTitle("模型已就绪");
+        b.setMessage("基础模型已经装好（model.int8.onnx + hy.gguf）。\n\n"
+                + "zipformer-ja 可选增强：" + zf + "/" + ZIPF_FILES.length + " 个文件。\n"
+                + "装齐后会自动走双车道，识别更准；不装也能正常用。\n\n"
+                + "点「导入 / 补装」再选一次 asmr-models.zip 就能补上，也可以单独选那几个文件。");
+        b.setPositiveButton("导入 / 补装", (d, w) -> { d.dismiss(); startModelImport(); });
+        if (remoteModelUrl != null && !remoteModelUrl.isEmpty()) {
+            final String url = remoteModelUrl;
+            b.setNeutralButton("下载页", (d, w) -> {
+                d.dismiss();
+                if (remoteModelCode != null && !remoteModelCode.isEmpty())
+                    copyText(remoteModelCode, "提取码 " + remoteModelCode + " 已复制");
+                openUrl(url);
+            });
+        }
+        b.setNegativeButton("关闭", (d, w) -> d.dismiss());
         try { b.show(); } catch (Exception ignored) { }
     }
 

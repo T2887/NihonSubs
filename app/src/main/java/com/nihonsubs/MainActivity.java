@@ -110,9 +110,6 @@ public class MainActivity extends Activity {
     private String remoteModelUrl = null;
     /** 网盘提取码（latest.txt 里的 MODEL_CODE，可空） */
     private String remoteModelCode = null;
-    /** zipformer-ja 可选增强的四个文件名。 */
-    private static final String[] ZIPF_FILES =
-            {"encoder.int8.onnx", "decoder.onnx", "joiner.onnx", "tokens.txt"};
     private int curIdx = 0;
     private float fileProgress = 0f;
     private volatile boolean stopping = false;
@@ -522,8 +519,6 @@ public class MainActivity extends Activity {
                 + "模型放进 models 目录（两个必装）：\n"
                 + "　· model.int8.onnx（语音识别，约 230 MB）\n"
                 + "　· hy.gguf（日语→中文翻译，约 1.1 GB）\n"
-                + "　可选增强：zipformer-ja 的 4 个文件放进\n"
-                + "　models/zipformer-ja/，识别更准（自动双车道）。\n"
                 + "点「导入模型」可以选单个文件，也可以选打包好的 zip。\n\n"
                 + "【放片子】\n"
                 + "点「添加文件」选视频或音频（mp4 / mkv / wmv / mp3 / wav 都行），\n"
@@ -659,19 +654,16 @@ public class MainActivity extends Activity {
         boolean gguf = new File(md, "hy.gguf").isFile();
 
         if (onnx && gguf) {
-            int zf = countZipformer();
             long onnxMb = new File(md, "model.int8.onnx").length() / (1024 * 1024);
             if (onnxMb > 500) {
                 // 常见事故：把 hy.gguf 选成了 model.int8.onnx
                 modelStateView.setText("识别模型异常（" + onnxMb + " MB，应为约 230 MB），请重新导入");
             } else {
-                modelStateView.setText(zf == ZIPF_FILES.length
-                        ? "模型已导入（含 zipformer-ja 增强）"
-                        : "模型已导入（可加装 zipformer-ja）");
+                modelStateView.setText("模型已导入");
             }
             modelStateView.setTextColor(OK_GREEN);
             modelBtn.setText("已导入");
-            // 保持可点：用户可能还要补装 zipformer-ja 或重新导入
+            // 保持可点：模型文件不对时可以重新导入覆盖
             modelBtn.setEnabled(true);
             modelBtn.setAlpha(1f);
         } else {
@@ -944,16 +936,8 @@ public class MainActivity extends Activity {
 
     // ── 模型导入（SAF 文件选择器）────────────────────────
     private void startModelImport() {
-        appendLog("[模型] 请选择 asmr-models.zip（推荐，一次装齐）；也可单独选 model.int8.onnx、hy.gguf 或 zipformer-ja 里的文件");
+        appendLog("[模型] 请选择 asmr-models.zip（推荐，一次装齐）；也可单独选 model.int8.onnx 或 hy.gguf");
         pickModelFile();
-    }
-
-    /** 数一下 zipformer-ja 已经装齐几个文件。 */
-    private int countZipformer() {
-        File zd = new File(modelDir(), "zipformer-ja");
-        int n = 0;
-        for (String name : ZIPF_FILES) if (new File(zd, name).isFile()) n++;
-        return n;
     }
 
     private void pickModelFile() {
@@ -1047,7 +1031,7 @@ public class MainActivity extends Activity {
 
     /**
      * 导入单个模型文件：按**用户实际选中的文件名**决定存到哪儿，不再依赖先选谁。
-     * 这样顺序随便（先 hy.gguf 也行），zipformer-ja 的 4 个文件也能一个个补进来。
+     * 这样顺序随便（先 hy.gguf 也行），压缩包里的文件也能一个个单独导入。
      */
     private void copyModel(final Uri uri) {
         String display = displayName(uri);
@@ -1073,7 +1057,7 @@ public class MainActivity extends Activity {
             target = "tokens.txt"; zipf = true;
         } else {
             appendLog("[模型] 不认识这个文件：" + display);
-            appendLog("[模型] 请选 asmr-models.zip，或 model.int8.onnx / hy.gguf（也可以是 zipformer-ja 里的文件）");
+            appendLog("[模型] 请选 asmr-models.zip，或 model.int8.onnx / hy.gguf");
             return;
         }
         final File dir = zipf ? new File(modelDir(), "zipformer-ja") : modelDir();
@@ -1122,11 +1106,7 @@ public class MainActivity extends Activity {
             boolean onnx = new File(md2, "model.int8.onnx").isFile();
             boolean gguf = new File(md2, "hy.gguf").isFile();
             if (onnx && gguf) {
-                if (countZipformer() == ZIPF_FILES.length) {
-                    appendLog("[模型] 基础模型与 zipformer-ja 都已就位，点「开始处理」即可");
-                } else {
-                    appendLog("[模型] 基础模型已就位。想更准可再导入 asmr-models.zip 补装 zipformer-ja（可选）");
-                }
+                appendLog("[模型] 两个模型都已就位，点「开始处理」即可");
                 setStage("当前阶段　就绪");
             } else {
                 appendLog("[模型] 还缺 " + (!onnx ? "model.int8.onnx" : "hy.gguf") + "，点「导入模型」继续选下一个");
@@ -1649,7 +1629,7 @@ public class MainActivity extends Activity {
 
     /** 「缺模型」引导：弹窗让用户去下载页取 asmr-models.zip（地址来自 latest.txt 的 MODEL_URL）。 */
     private void promptModelDownload() {
-        // 基础模型已在位：这个按钮改成「补装 / 重新导入」入口，而不是只弹下载页
+        // 模型已在位：这个按钮改成「重新导入」入口，而不是只弹下载页
         File md0 = modelDir();
         if (new File(md0, "model.int8.onnx").isFile() && new File(md0, "hy.gguf").isFile()) {
             showModelReadyDialog();
@@ -1720,16 +1700,13 @@ public class MainActivity extends Activity {
         try { b.show(); } catch (Exception ignored) { }
     }
 
-    /** 模型已在位时的入口：补装 zipformer-ja / 重新导入 / 打开下载页。 */
+    /** 模型已在位时的入口：重新导入 / 打开下载页。 */
     private void showModelReadyDialog() {
-        final int zf = countZipformer();
         android.app.AlertDialog.Builder b = new android.app.AlertDialog.Builder(this);
-        b.setTitle("模型已就绪");
-        b.setMessage("基础模型已经装好（model.int8.onnx + hy.gguf）。\n\n"
-                + "zipformer-ja 可选增强：" + zf + "/" + ZIPF_FILES.length + " 个文件。\n"
-                + "装齐后会自动走双车道，识别更准；不装也能正常用。\n\n"
-                + "点「导入 / 补装」再选一次 asmr-models.zip 就能补上，也可以单独选那几个文件。");
-        b.setPositiveButton("导入 / 补装", (d, w) -> { d.dismiss(); startModelImport(); });
+        b.setTitle("模型已导入");
+        b.setMessage("model.int8.onnx 与 hy.gguf 都已就位，可以直接开始处理。\n\n"
+                + "需要覆盖重装时点「重新导入」，选下载好的 asmr-models.zip（或单独选那两个文件）。");
+        b.setPositiveButton("重新导入", (d, w) -> { d.dismiss(); startModelImport(); });
         if (remoteModelUrl != null && !remoteModelUrl.isEmpty()) {
             final String url = remoteModelUrl;
             b.setNeutralButton("下载页", (d, w) -> {

@@ -6,4 +6,4 @@ VERSION=1.1.4
 APK=https://github.com/T2887/NihonSubs/releases/download/v1.1.4/NihonSubs-v1.1.4.apk
 MODEL_URL=https://pan.quark.cn/s/42530f352af0
 MODEL_CODE=GHXq
-NOTE=v1.1.4：导入模型按文件名自动归位（顺序随意，encoder-epoch-99 这类原始文件名也认），导入按钮不再置灰，可随时补装 zipformer-ja，并提示识别模型体积异常。备用百度网盘 https://pan.baidu.com/s/1UrvC4AaxsV-BBJWOrTNUdg?pwd=c82t 提取码 c82t。
+NOTE=v1.1.4：导入模型按文件名自动归位（先选 hy.gguf 也行，encoder-epoch-99 这类原始文件名也认），导入按钮不再置灰；识别模型体积异常时会提示重新导入。备用百度网盘 https://pan.baidu.com/s/1UrvC4AaxsV-BBJWOrTNUdg?pwd=c82t 提取码 c82t。

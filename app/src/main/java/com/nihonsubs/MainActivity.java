@@ -139,6 +139,7 @@ public class MainActivity extends Activity {
     private boolean rowSwiping = false;
     private boolean askedAllFiles = false;
     private float edgeDownX = 0f, edgeDownY = 0f;
+    private float qDownX = 0f, qDownY = 0f;
     private String notifiedStage = "";       // 0..1
     private ValueAnimator progressAnim;
 
@@ -559,7 +560,28 @@ public class MainActivity extends Activity {
     /** 屏幕左侧往右划 → 打开队列页。用 dispatchTouchEvent 抓，避免和列表点击打架。 */
     @Override
     public boolean dispatchTouchEvent(MotionEvent ev) {
-        if (queueOverlay == null || queueOverlay.getVisibility() == View.VISIBLE) {
+        if (queueOverlay == null) {
+            return super.dispatchTouchEvent(ev);
+        }
+        if (queueOverlay.getVisibility() == View.VISIBLE) {
+            // 队列页里横向划一下（往左或往右）就收起来；正在拖已选行左划移除时除外
+            switch (ev.getActionMasked()) {
+                case MotionEvent.ACTION_DOWN:
+                    qDownX = ev.getX();
+                    qDownY = ev.getY();
+                    break;
+                case MotionEvent.ACTION_UP: {
+                    float dx = ev.getX() - qDownX;
+                    float dy = ev.getY() - qDownY;
+                    if (!rowSwiping && Math.abs(dx) > dp(90)
+                            && Math.abs(dy) < Math.abs(dx) * 0.7f) {
+                        closeQueue();
+                    }
+                    break;
+                }
+                default:
+                    break;
+            }
             return super.dispatchTouchEvent(ev);
         }
         switch (ev.getActionMasked()) {
@@ -659,7 +681,7 @@ public class MainActivity extends Activity {
         head.addView(close);
         col.addView(head);
 
-        TextView tip = label("上下滑动看全部 · 长按任务选中 · 选中后往左划移除", INK3, 11f);
+        TextView tip = label("上下滑动看全部 · 点一下或长按选中 · 选中后往左划移除 · 左右划空白处收起", INK3, 11f);
         LinearLayout.LayoutParams tipLp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
         tipLp.topMargin = (int) dp(8);
@@ -974,8 +996,9 @@ public class MainActivity extends Activity {
                 + "点「添加文件」选视频或音频（mp4 / mkv / wmv / mp3 / wav 都行），\n"
                 + "或者用数据线拷进 input 目录，重开 App 会自动扫出来。\n\n"
                 + "【队列】\n"
-                + "从屏幕左边缘往右划，打开整屏队列：上下滑动看全部任务，\n"
-                + "长按选中，选中后往左划即从队列移除。\n\n"
+                + "屏幕从左往右划（或点「文件列表」右上角「队列」）打开整屏队列：\n"
+                + "上下滑动看全部任务，点一下或长按选中，选中后往左划即从队列移除，\n"
+                + "在空白处左右划一下收起队列页。\n\n"
                 + "【开始处理】\n"
                 + "点「开始处理」后四步全自动，不用管：\n"
                 + "　1/4 提取音频　2/4 起翻译服务\n"

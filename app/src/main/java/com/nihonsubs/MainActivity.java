@@ -102,10 +102,20 @@ public class MainActivity extends Activity {
     private FrameLayout progressTrack;
     private TextView startBtn, stopBtn;
     private TextView statView;          // 进度卡的「运行状态」行（CPU/吞吐）
+    private TextView previewView;       // 「字幕预览」卡里的最新几句
+    private ScrollView previewScroll;
     private TextView subtitleView;
     private TextView modelStateView;   // 环境卡里的「模型」状态文字
     private TextView modelBtn;         // 「导入模型」按钮（导入后置灰不可点）
     private final List<String> picked = new ArrayList<>();
+    private TextView pauseBtn;                       // 底部「暂停 / 继续」按钮
+    private volatile boolean paused = false;         // 推理进程已被 SIGSTOP 冻结
+    private volatile boolean skipDoneFiles = false;  // 续跑上次队列时跳过「完成」的
+    private static final String QPREF = "queue";      // 队列持久化（意外退出后续跑）
+    // 启动瞬间先抄一份上次的队列：界面上来就会 refreshFiles() 把状态刷成「待处理」，
+    // 直接读偏好设置的话，「已完成」的信息在弹窗之前就没了，续跑就全量重跑。
+    private String resumeFilesRaw = null;
+    private boolean resumeWasRunning = false;
 
     private Process running;
     private boolean busy = false;
@@ -137,6 +147,7 @@ public class MainActivity extends Activity {
     private LinearLayout queueList;
     private ScrollView queueScroll;
     private TextView queueSub;
+    private TextView queueLive;   // 队列页里那行「当前阶段 + 运行状态」
     private final Set<String> queueSel = new java.util.LinkedHashSet<>();
     private boolean rowSwiping = false;
     private boolean askedAllFiles = false;
@@ -274,13 +285,24 @@ public class MainActivity extends Activity {
         if (BuildVersion.atLeast(23)) {
             w.getDecorView().setSystemUiVisibility(View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR);
         }
+        outFmt = getSharedPreferences("nihon", MODE_PRIVATE).getString("fmt", "both");
+        softSub = getSharedPreferences("nihon", MODE_PRIVATE).getString("soft", "off");
+        outLang = getSharedPreferences("nihon", MODE_PRIVATE).getString("lang", "zh");
+        asrMode = getSharedPreferences("nihon", MODE_PRIVATE).getString("asr", "fusion");
+        // 赶在 buildUi / scanInputDir 覆盖之前把上次的队列抄下来
+        resumeFilesRaw = getSharedPreferences(QPREF, MODE_PRIVATE).getString("files", "");
+        resumeWasRunning = getSharedPreferences(QPREF, MODE_PRIVATE).getBoolean("running", false);
         setContentView(buildUi());
         scanInputDir();
         // 老版本模型在 /sdcard（FUSE），后台搬到私有目录；只搬一次。
         new Thread(this::migrateModelsIfNeeded, "model-migrate").start();
+        // 上次要是被强杀/崩溃，临时文件会留在 bin/ 里，开机顺手收掉
+        ui.postDelayed(this::cleanWorkFiles, 900);
         // 启动后自动检查一次更新（静默，仅在有新版本时提示）
         ui.postDelayed(() -> checkForUpdate(false), 2000);
         ui.postDelayed(this::ensureAllFilesAccess, 1200);
+        // 上次队列没跑完（App 被系统杀掉 / 崩溃 / 手滑退出）→ 问要不要接着跑
+        ui.postDelayed(this::promptResumeQueue, 1600);
     }
 
     /** 启动时扫一遍 input 目录：从电脑拷进来的文件不用再手动选。 */
@@ -363,6 +385,11 @@ public class MainActivity extends Activity {
         subLp.topMargin = (int) dp(3);
         titles.addView(subtitleView, subLp);
         header.addView(titles);
+        // 底部动作条要留给「暂停」，所以「使用说明」移到右上角
+        header.addView(new View(this), new LinearLayout.LayoutParams(0, 1, 1f));
+        TextView helpTop = narrowPill("使用说明");
+        helpTop.setOnClickListener(v -> showHelp());
+        header.addView(helpTop, new LinearLayout.LayoutParams((int) dp(82), (int) dp(32)));
         content.addView(header);
         enterAnim(header, 0);
 
@@ -387,12 +414,12 @@ public class MainActivity extends Activity {
             catch (Exception ignored) {}
             ver.addView(label("版本 " + vn + " · 检查更新", INK3, 11f), new LinearLayout.LayoutParams(
                     0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
-            TextView upd = narrowPill("检查更新");
-            upd.setTextSize(12f);
+            // 和上面「已导入」那个主按钮同宽同高，看着才是一对
+            TextView upd = pill("检查更新", false, 34);
+            upd.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 12.5f);
             final String _vn = vn;
             upd.setOnClickListener(v -> checkForUpdate(true));
-            ver.addView(upd, new LinearLayout.LayoutParams(
-                    ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+            ver.addView(upd, new LinearLayout.LayoutParams((int) dp(96), (int) dp(34)));
             env.addView(ver);
         }
         content.addView(env);
@@ -439,6 +466,92 @@ public class MainActivity extends Activity {
         });
         fileBtns.addView(delBtn, third());
         files.addView(fileBtns, fblp);
+
+        // 识别模式（三个车道）
+        TextView asrCap = label("识别模式", INK3, 12.5f);
+        LinearLayout.LayoutParams asrCapLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        asrCapLp.topMargin = (int) dp(12);
+        files.addView(asrCap, asrCapLp);
+        LinearLayout asrRow = new LinearLayout(this);
+        asrRow.setOrientation(LinearLayout.HORIZONTAL);
+        asrFusion = asrPill("融合模式", "fusion");
+        asrZip = asrPill("zipformer", "zip");
+        asrSv = asrPill("SenseVoice", "sv");
+        asrRow.addView(asrFusion, third());
+        asrRow.addView(asrZip, third());
+        asrRow.addView(asrSv, third());
+        LinearLayout.LayoutParams asrRowLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        asrRowLp.topMargin = (int) dp(6);
+        files.addView(asrRow, asrRowLp);
+        asrHintView = label("", INK3, 11.5f);
+        LinearLayout.LayoutParams asrHintLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        asrHintLp.topMargin = (int) dp(4);
+        files.addView(asrHintView, asrHintLp);
+
+        // 字幕语言
+        TextView langCap = label("字幕语言", INK3, 12.5f);
+        LinearLayout.LayoutParams langCapLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        langCapLp.topMargin = (int) dp(12);
+        files.addView(langCap, langCapLp);
+        LinearLayout langRow = new LinearLayout(this);
+        langRow.setOrientation(LinearLayout.HORIZONTAL);
+        langZh = langPill("中文翻译", "zh");
+        langJa = langPill("仅日文", "ja");
+        langRow.addView(langZh, half());
+        langRow.addView(langJa, half());
+        LinearLayout.LayoutParams langRowLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        langRowLp.topMargin = (int) dp(6);
+        files.addView(langRow, langRowLp);
+
+        // 输出格式（写到原片旁边的是哪几份）
+        TextView fmtCap = label("输出格式", INK3, 12.5f);
+        LinearLayout.LayoutParams fmtCapLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        fmtCapLp.topMargin = (int) dp(12);
+        files.addView(fmtCap, fmtCapLp);
+        LinearLayout fmtRow = new LinearLayout(this);
+        fmtRow.setOrientation(LinearLayout.HORIZONTAL);
+        fmtSrt = fmtPill("只要 SRT", "srt");
+        fmtLrc = fmtPill("只要 LRC", "lrc");
+        fmtBoth = fmtPill("两个都要", "both");
+        fmtRow.addView(fmtSrt, third());
+        fmtRow.addView(fmtLrc, third());
+        fmtRow.addView(fmtBoth, third());
+        LinearLayout.LayoutParams fmtRowLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        fmtRowLp.topMargin = (int) dp(6);
+        files.addView(fmtRow, fmtRowLp);
+
+        // 字幕封装：默认只有字幕文件；开了就额外存一个带字幕的 mkv
+        TextView softCap = label("字幕封装", INK3, 12.5f);
+        LinearLayout.LayoutParams softCapLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        softCapLp.topMargin = (int) dp(12);
+        files.addView(softCap, softCapLp);
+        LinearLayout softRow = new LinearLayout(this);
+        softRow.setOrientation(LinearLayout.HORIZONTAL);
+        softOff = softPill("外挂字幕", "off");
+        softOn = softPill("软字幕（mkv）", "on");
+        softRow.addView(softOff, half());
+        softRow.addView(softOn, half());
+        LinearLayout.LayoutParams softRowLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        softRowLp.topMargin = (int) dp(6);
+        files.addView(softRow, softRowLp);
+        softHint = label("", INK3, 11.5f);
+        LinearLayout.LayoutParams softHintLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        softHintLp.topMargin = (int) dp(4);
+        files.addView(softHint, softHintLp);
+        applySoft();
+        applyFmt();
+        applyLang();
+        applyAsr();
         content.addView(files);
         enterAnim(files, 2);
 
@@ -485,8 +598,9 @@ public class MainActivity extends Activity {
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
         actLp.topMargin = (int) dp(6);
         actionView = label("当前动作　—", INK3, 11.5f);
-        actionView.setSingleLine(true);
-        actionView.setEllipsize(android.text.TextUtils.TruncateAt.END);
+        // 这两行内容经常比一屏宽（识别速度、融合翻译的长描述），
+        // 单行省略号会被截掉一半，改成最多两行、自动折行，卡片跟着变高。
+        actionView.setMaxLines(2);
         prog.addView(actionView, actLp);
 
         // 「运行状态」行：跑任务时每 2 秒刷一次 CPU 频率 / 模型 tok/s / 占用核数
@@ -494,15 +608,29 @@ public class MainActivity extends Activity {
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
         statRowLp.topMargin = (int) dp(4);
         statView = label("运行状态　—", INK3, 11f);
-        statView.setSingleLine(true);
-        statView.setEllipsize(android.text.TextUtils.TruncateAt.END);
+        statView.setMaxLines(2);
         prog.addView(statView, statRowLp);
         content.addView(prog);
         enterAnim(prog, 3);
 
-        // ── 卡片 4：日志 ──
+        // ── 卡片 4：字幕预览（边跑边出，只留最新几句）──
+        LinearLayout prevCard = (LinearLayout) card();
+        cardTitle(prevCard, "字幕预览");
+        previewScroll = new ScrollView(this);
+        previewScroll.setBackground(round(SUNK, 10, CARD_LINE, 1));
+        previewScroll.setPadding((int) dp(10), (int) dp(8), (int) dp(10), (int) dp(8));
+        previewView = label("还没开始跑。开跑后这里会一句句冒出来。", INK3, 11.5f);
+        previewView.setLineSpacing(dp(4), 1f);
+        previewScroll.addView(previewView);
+        prevCard.addView(previewScroll, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, (int) dp(150)));
+        content.addView(prevCard, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        enterAnim(prevCard, 4);
+
+        // ── 卡片 5：日志 ──
         LinearLayout logs = (LinearLayout) card();
-        cardTitle(logs, "运行日志");
+        cardTitle(logs, "运行日志", "导出", this::exportLog);
         logScroll = new ScrollView(this);
         logScroll.setBackground(round(SUNK, 10, CARD_LINE, 1));
         logScroll.setPadding((int) dp(10), (int) dp(8), (int) dp(10), (int) dp(8));
@@ -511,11 +639,15 @@ public class MainActivity extends Activity {
         logView.setLineSpacing(dp(3), 1f);
         logScroll.addView(logView);
         logScroll.setMinimumHeight((int) dp(120));
+        // 以前这里是 0 + weight=1，靠「吃掉剩余高度」撑开。但文件列表卡片加上
+        // 「字幕语言 / 输出格式」两组按钮后，剩余高度被算成 0，
+        // 结果标题「运行日志 + 导出」被挤出可视区（实测 dump 里整块消失）。
+        // 改成固定高度，滚动由外层 ScrollView 负责，稳定且不会被裁。
         logs.addView(logScroll, new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
+                ViewGroup.LayoutParams.MATCH_PARENT, (int) dp(210)));
         content.addView(logs, new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
-        enterAnim(logs, 4);
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        enterAnim(logs, 5);
 
         // ── 底部固定动作条 ──
         LinearLayout bar = new LinearLayout(this);
@@ -525,26 +657,26 @@ public class MainActivity extends Activity {
         bar.setPadding((int) dp(14), (int) dp(8), (int) dp(14), (int) dp(12));
         bar.setElevation(dp(6));
 
+        // 三个按钮等宽等高等权重：以前 WRAP_CONTENT 导致「停止」比「开始处理」窄一截，视觉不齐
         startBtn = pill("开始处理", true, 46);
         startBtn.setOnClickListener(v -> start());
-        bar.addView(startBtn);
+        bar.addView(startBtn, new LinearLayout.LayoutParams(0, (int) dp(46), 1f));
+
+        pauseBtn = pill("暂停", false, 46);
+        LinearLayout.LayoutParams pzlp = new LinearLayout.LayoutParams(0, (int) dp(46), 1f);
+        pzlp.leftMargin = (int) dp(8);
+        pauseBtn.setOnClickListener(v -> togglePause());
+        pauseBtn.setAlpha(0.4f);
+        pauseBtn.setEnabled(false);
+        bar.addView(pauseBtn, pzlp);
 
         stopBtn = pill("停止", false, 46);
-        LinearLayout.LayoutParams stlp = new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        stlp.leftMargin = (int) dp(10);
+        LinearLayout.LayoutParams stlp = new LinearLayout.LayoutParams(0, (int) dp(46), 1f);
+        stlp.leftMargin = (int) dp(8);
         stopBtn.setOnClickListener(v -> stop());
         stopBtn.setAlpha(0.4f);
         stopBtn.setEnabled(false);
         bar.addView(stopBtn, stlp);
-
-        // 弹性占位：把「使用说明」推到最右
-        View spacer = new View(this);
-        bar.addView(spacer, new LinearLayout.LayoutParams(0, 1, 1f));
-
-        TextView helpBtn = pill("使用说明", false, 46);
-        helpBtn.setOnClickListener(v -> showHelp());
-        bar.addView(helpBtn);
 
         FrameLayout.LayoutParams blp = new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
@@ -621,6 +753,7 @@ public class MainActivity extends Activity {
         if (queueOverlay == null) return;
         queueSel.clear();
         refreshQueue();
+        syncQueueLive();
         queueOverlay.animate().cancel();
         // 和手势同向：从左边缘往右划 → 队列页从左边滑进来
         queueOverlay.setTranslationX(-getResources().getDisplayMetrics().widthPixels);
@@ -684,6 +817,16 @@ public class MainActivity extends Activity {
         close.setOnClickListener(v -> closeQueue());
         head.addView(close);
         col.addView(head);
+
+        // 队列页也要看得到「正在干什么」：当前阶段 + 运行状态（段速/补车道/模型加载），
+        // 以前只有主界面进度卡有，打开队列就两眼一抹黑。
+        queueLive = label("空闲 · 点「开始处理」开始，进度会在这里实时刷新", INK2, 12f);
+        queueLive.setBackground(round(CARD, 10, CARD_LINE, 1));
+        queueLive.setPadding((int) dp(12), (int) dp(10), (int) dp(12), (int) dp(10));
+        LinearLayout.LayoutParams qllp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        qllp.topMargin = (int) dp(10);
+        col.addView(queueLive, qllp);
 
         TextView tip = label("上下滑动看全部 · 点一下或长按选中 · 选中后往左划移除 · 左右划空白处收起", INK3, 11f);
         LinearLayout.LayoutParams tipLp = new LinearLayout.LayoutParams(
@@ -870,6 +1013,28 @@ public class MainActivity extends Activity {
         queueSig = queueSignature();
     }
 
+    /** 把主界面的「当前阶段 / 运行状态」同步到队列页那行提示。 */
+    private void syncQueueLive() {
+        if (queueLive == null) return;
+        if (!busy) {
+            int done = 0;
+            for (String p : picked) if ("完成".equals(stateOf(p))) done++;
+            queueLive.setText(picked.isEmpty()
+                    ? "空闲 · 队列是空的，回主界面点「添加文件」"
+                    : "空闲 · 共 " + picked.size() + " 个，完成 " + done + " 个");
+            return;
+        }
+        String stage = stageView == null ? "" : stageView.getText().toString().trim();
+        String stat = statView == null ? "" : statView.getText().toString().trim();
+        StringBuilder b = new StringBuilder();
+        if (!stage.isEmpty()) b.append(stage);
+        if (!stat.isEmpty()) {
+            if (b.length() > 0) b.append('\n');
+            b.append(stat);
+        }
+        queueLive.setText(b.length() == 0 ? "处理中…" : b.toString());
+    }
+
     private float swipeStartX = 0f;
     private long queueTouchAt = 0L;
     private String queueSig = null;
@@ -992,38 +1157,109 @@ public class MainActivity extends Activity {
         // 路径写成相对形式：完整路径太长，窄屏上会被折行，反而不好认
         String txt =
                 "【第一次用】\n"
-                + "模型由 App 自己保管（两个必装，导入一次即可）：\n"
-                + "　· model.int8.onnx（语音识别，约 230 MB）\n"
-                + "　· hy.gguf（日语→中文翻译，约 1.1 GB）\n"
-                + "点「导入模型」选打包好的 zip 最省事，也可以一个个选文件。\n"
-                + "（模型存在 App 私有目录，不用手动放、也不会被清理软件删）\n\n"
+                + "模型由 App 自己保管，导入一次即可。\n"
+                + "推荐直接选模型包 asmr-models.zip\n"
+                + "（约 1.5 GB，一次装齐，三种模式都能用）。\n"
+                + "单独装也行，但要按想用的模式挑：\n"
+                + "　· 融合 / zipformer 模式：\n"
+                + "　　要 zipformer-ja/ 那 4 个文件\n"
+                + "　　（encoder.int8.onnx、decoder.onnx、\n"
+                + "　　　joiner.onnx、tokens.txt）\n"
+                + "　· SenseVoice 模式：要 model.int8.onnx\n"
+                + "　· 不管哪种模式，都要 hy.gguf（翻译用）\n"
+                + "点「导入模型」选 zip 最省事。\n"
+                + "（模型存在 App 私有目录，不用手动放、\n"
+                + "　也不会被清理软件删）\n"
+                + "\n"
                 + "【放片子】\n"
-                + "点「添加文件」选视频或音频（mp4 / mkv / wmv / mp3 / wav 都行），\n"
-                + "或者用数据线拷进 input 目录，重开 App 会自动扫出来。\n\n"
+                + "点「添加文件」选视频或音频\n"
+                + "（mp4 / mkv / wmv / mp3 / wav 都行），\n"
+                + "或者用数据线拷进 input 目录，重开 App 会自动扫出来。\n"
+                + "\n"
                 + "【队列】\n"
-                + "屏幕从左往右划（或点「文件列表」右上角「队列」）打开整屏队列：\n"
-                + "上下滑动看全部任务，点一下或长按选中，选中后往左划即从队列移除，\n"
-                + "在空白处左右划一下收起队列页。\n\n"
+                + "屏幕从左往右划（或点「文件列表」右上角「队列」）\n"
+                + "打开整屏队列：\n"
+                + "上下滑动看全部任务；点一下或长按选中，\n"
+                + "选中后往左划即从队列移除；\n"
+                + "在空白处左右划一下收起队列页。\n"
+                + "\n"
+                + "【识别模式】\n"
+                + "三选一，默认「融合模式」：\n"
+                + "　· SenseVoice：速度快、覆盖广，\n"
+                + "　　ASMR 里各种音效段都能碰到，但长难句、\n"
+                + "　　同音字容易听错。\n"
+                + "　· zipformer：认得最准，整句更通顺，\n"
+                + "　　但安静段、纯音效段可能整句漏掉。\n"
+                + "　· 融合模式（默认）：两个都跑，\n"
+                + "　　zipformer 打底、SenseVoice 补漏，\n"
+                + "　　又全又准，代价是识别阶段慢一点。\n"
+                + "选错也不影响出字幕，换一个模式重跑就行。\n\n"
                 + "【开始处理】\n"
                 + "点「开始处理」后四步全自动，不用管：\n"
-                + "　1/4 提取音频　2/4 起翻译服务\n"
-                + "　3/4 语音识别　4/4 翻译并写字幕\n"
-                + "切到别的 App 也会继续跑，进度会显示在通知栏。\n\n"
+                + "　1/4 提取音频　2/4 语音识别\n"
+                + "　3/4 起翻译服务　4/4 翻译并写字幕\n"
+                + "切到别的 App 也会继续跑，进度会显示在通知栏。\n"
+                + "\n"
+                + "【字幕预览】\n"
+                + "进度卡下面那张卡会边跑边出内容：\n"
+                + "识别阶段先显示日文原文，\n"
+                + "翻译阶段一句句换成中文，只留最新几句。\n"
+                + "全片跑完以生成的字幕文件为准。\n"
+                + "\n"
+                + "【暂停 / 继续】\n"
+                + "处理中随时可以点「暂停」，处理进程被原地冻结，\n"
+                + "已识别的、已翻译的都留在内存里。\n"
+                + "点「继续」从停下的地方接着跑，不丢进度、不重跑。\n"
+                + "「停止」才是真正中断当前任务。\n"
+                + "\n"
+                + "【别被杀掉】\n"
+                + "长任务怕系统清后台，建议先设一次：\n"
+                + "· 小米 / 红米：省电策略 → 无限制，\n"
+                + "　最近任务卡片下拉加锁\n"
+                + "· 华为 / 荣耀：应用启动管理 → 关「自动管理」，\n"
+                + "　打开自启动和后台活动，卡片下拉加锁\n"
+                + "· OPPO / 一加 / 真我：电池 → 应用耗电管理，\n"
+                + "　允许后台运行，卡片长按 → 锁定\n"
+                + "· vivo / iQOO：电池 → 后台耗电管理，\n"
+                + "　允许后台高耗电；i 管家 → 自启动 → 允许\n"
+                + "· 三星：电池 → 后台使用限制，\n"
+                + "　永不休眠的应用 → 加上本 App\n"
+                + "· 原生安卓：应用 → 电池 → 不受限制\n"
+                + "跑的时候别点「清理后台」和一键加速。\n"
+                + "真被杀了也不丢进度，见下一段。\n"
+                + "\n"
+                + "【意外退出】\n"
+                + "队列没跑完就被系统清理或自己崩了，\n"
+                + "下次打开 App 会弹「继续上次队列」，\n"
+                + "点「继续」接着处理，已完成的文件自动跳过。\n"
+                + "\n"
                 + "【拿字幕】\n"
-                + "字幕直接写在原片所在文件夹（首次会让你授予「所有文件访问」；\n"
-                + "没授权就放在 App 的 output 目录）。每个片子生成\n"
+                + "字幕直接写在原片所在文件夹；\n"
+                + "首次会请你授予「所有文件访问」，\n"
+                + "没授权就放在 App 的 output 目录。\n"
+                + "每个片子按「输出格式」生成（默认两个都要）：\n"
                 + "　<原文件名>.chs.srt　（播放器外挂字幕）\n"
                 + "　<原文件名>.chs.lrc　（音乐播放器逐行歌词）\n"
                 + "和视频放一起，用播放器加载就能看。\n"
+                + "\n"
+                + "【软字幕】\n"
+                + "「字幕封装」选「软字幕（mkv）」时，\n"
+                + "不再单独留字幕文件，而是把字幕嵌进视频，\n"
+                + "在原片旁另存一个 <原文件名>.mkv，\n"
+                + "播放器里能开关字幕。\n"
+                + "不重新编码，体积和原片差不多。\n"
+                + "做完会问你要不要删掉原文件。\n"
+                + "（只有 mkv 能装字幕，mp4 装不了）\n"
                 + "（字幕/输入目录在 Android/data/com.nihonsubs/files 下；\n"
-                + "　模型在 App 私有目录，不用手管）\n\n"
+                + "　模型在 App 私有目录，不用手管）\n"
+                + "\n"
                 + "【耗时参考】\n"
                 + "90 秒的片子约 31 秒；16 分钟约 6~7 分钟；91 分钟约 12 分钟。\n"
                 + "全程离线，不联网。\n\n"
                 + "【常见问题】\n"
                 + "· 字幕条数少：ASMR 片子环境音多，纯音效段会被跳过，正常\n"
                 + "· 准确度：手机上用的是 int8 量化模型，比 PC 版略逊属正常\n"
-                + "· 卡住不动：点「停止」再点一次「开始处理」";
+                + "· 卡住不动：点「暂停」再「继续」；还不行就点「停止」重来";
 
         LinearLayout box = new LinearLayout(this);
         box.setOrientation(LinearLayout.VERTICAL);
@@ -1064,7 +1300,38 @@ public class MainActivity extends Activity {
             dlg.getWindow().setLayout(
                     ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
         }
-        ok.setOnClickListener(v -> dlg.dismiss());
+        // 首次打开必须先滑到底才让点：内容没看完就关掉，等于没写说明。
+        // （内容不足一屏时直接解锁，不会把按钮卡死。）
+        ok.setText("往下滑看完才能继续");
+        ok.setAlpha(0.45f);
+        ok.setEnabled(false);
+        final Runnable unlock = () -> {
+            ok.setText("知道了");
+            ok.setEnabled(true);
+            ok.setAlpha(1f);
+        };
+        sc.setOnScrollChangeListener((v, sx, sy, osx, osy) -> {
+            View child = sc.getChildAt(0);
+            if (child == null) {
+                return;
+            }
+            int max = Math.max(0, child.getHeight() - sc.getHeight());
+            if (sy >= max - dp(6)) {
+                unlock.run();
+            }
+        });
+        sc.post(() -> {
+            View child = sc.getChildAt(0);
+            if (child != null && child.getHeight() <= sc.getHeight() + dp(4)) {
+                unlock.run();
+            }
+        });
+        ok.setOnClickListener(v -> {
+            if (!ok.isEnabled()) {
+                return;
+            }
+            dlg.dismiss();
+        });
         dlg.show();
     }
 
@@ -1122,7 +1389,7 @@ public class MainActivity extends Activity {
 
         modelBtn = pill("导入模型", true, 34);
         modelBtn.setOnClickListener(v -> promptModelDownload());
-        row.addView(modelBtn);
+        row.addView(modelBtn, new LinearLayout.LayoutParams((int) dp(96), (int) dp(34)));
 
         // 建完 UI 之后刷新一次（此时 modelDir 已可读）
         ui.post(this::refreshModelRow);
@@ -1285,7 +1552,195 @@ public class MainActivity extends Activity {
     }
 
     private TextView delBtn;
+
+    // ── 输出格式：只要 SRT / 只要 LRC / 两个都要（默认两个都要）──
+    private TextView fmtSrt, fmtLrc, fmtBoth;
+    private String outFmt = "both";
+
+    // ── 字幕封装：off = 只出字幕文件；on = 另存一个内嵌字幕的 mkv ──
+    private TextView softOff, softOn, softHint;
+    private String softSub = "off";
+    // ── 识别模式：融合（默认）/ zipformer 单模 / SenseVoice 单模 ──
+    private TextView asrFusion, asrZip, asrSv, asrHintView;
+    private String asrMode = "fusion";
+    // ── 字幕语言：中文翻译（默认）/ 仅日文（不翻译，跳过 2 GB 翻译模型）──
+    private TextView langZh, langJa;
+    private String outLang = "zh";
+    // 识别进度基准（段数 + 时间戳），用来算「段/分」
+    // 识别速度用 60 秒滑动窗口 [毫秒, 已完成段数]。
+    // 原来是「相邻两次采样做差」：sherpa 每批退出重启那 1~2 秒采不到进度，
+    // 恢复后 4 段 / 2 秒 → 算出 120 段/分、39× 实时，比真实（约 22 段/分、7×）虚高 5 倍。
+    private final java.util.ArrayDeque<long[]> asrSamples = new java.util.ArrayDeque<>();
+    // 批次之间 sherpa 会退出再重启（MEM 保护），那 1~2 秒读不到进度。
+    // 段速/倍速要「一直显示」，所以把最后一次算出的值和进度记下来接着用。
+    private volatile double lastSpm = 0;
+    private volatile int lastAsrDone = -1, lastAsrTotal = 0;
+    private long mtStartMs = 0;   // 翻译阶段计时起点（算倍速用）
+    // 「共 N 段 / 第 k 段」：识别读 bin/_asr_progress，翻译读 bin/_mt_progress，
+    // 都是 run.sh / native 层每完成一段覆盖写的 "done total"。segPhase 决定进度条走哪一段区间。
+    private int segDone = -1, segTotal = -1;
+    private String segPhase = null;
+    private long asrPrevMs = 0;
     private final java.util.LinkedHashSet<String> selSet = new java.util.LinkedHashSet<>();
+
+    private static String srtToLrcName(String srtName) {
+        if (srtName.endsWith(".srt")) {
+            return srtName.substring(0, srtName.length() - 4) + ".lrc";
+        }
+        return srtName + ".lrc";
+    }
+
+    /** 两个字一排的按钮槽位（语言选择用）。 */
+    private LinearLayout.LayoutParams half() {
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0, (int) dp(44), 1f);
+        lp.leftMargin = (int) dp(3);
+        lp.rightMargin = (int) dp(3);
+        return lp;
+    }
+
+    private TextView langPill(String text, final String key) {
+        TextView b = narrowPill(text);
+        b.setTag(key);
+        b.setOnClickListener(v -> {
+            if (!key.equals(outLang)) {
+                outLang = key;
+                getSharedPreferences("nihon", MODE_PRIVATE).edit()
+                        .putString("lang", outLang).apply();
+                applyLang();
+            }
+        });
+        return b;
+    }
+
+
+    /** 识别模式按钮：融合（默认）/ zipformer 单模 / SenseVoice 单模。 */
+    private TextView asrPill(String text, final String key) {
+        TextView b = narrowPill(text);
+        b.setTag(key);
+        b.setOnClickListener(v -> {
+            if (busy) {
+                // 任务跑起来后模式已经传给 run.sh 了，这时候改只会让人以为生效了
+                toast("任务进行中，改不了识别模式；等它结束或先点「停止」");
+                return;
+            }
+            if (!key.equals(asrMode)) {
+                asrMode = key;
+                getSharedPreferences("nihon", MODE_PRIVATE).edit()
+                        .putString("asr", asrMode).apply();
+                applyAsr();
+            }
+        });
+        return b;
+    }
+
+    /** 选中态 + 说明文字（把两个模型的差别讲清楚，别让人猜）。 */
+    private void applyAsr() {
+        // 处理中（包括暂停）锁住：模式在启动时就交给 run.sh 了，中途改不会生效
+        final boolean locked = busy;
+        for (TextView b : new TextView[]{asrFusion, asrZip, asrSv}) {
+            if (b == null) continue;
+            boolean on = asrMode.equals(b.getTag());
+            b.setTextColor(on ? 0xFFFFFFFF : INK2);
+            b.setBackground(on ? round(ACCENT_DEEP, 22, 0, 0) : round(SUNK, 22, CARD_LINE, 1));
+            b.setEnabled(!locked);
+            b.setAlpha(locked ? 0.45f : 1f);
+        }
+        if (asrHintView == null) return;
+        if ("zip".equals(asrMode)) {
+            asrHintView.setText("只用 zipformer：认得更准，但安静段/纯音效段可能漏句");
+        } else if ("sv".equals(asrMode)) {
+            asrHintView.setText("只用 SenseVoice：快、覆盖广，长难句和同音字容易错");
+        } else {
+            asrHintView.setText("两个模型都用：覆盖广、更准，速度略慢（默认）");
+        }
+    }
+    private void applyLang() {
+        for (TextView b : new TextView[]{langZh, langJa}) {
+            if (b == null) {
+                continue;
+            }
+            boolean on = outLang.equals(b.getTag());
+            b.setTextColor(on ? 0xFFFFFFFF : INK2);
+            b.setBackground(on ? round(ACCENT_DEEP, 22, 0, 0) : round(SUNK, 22, CARD_LINE, 1));
+        }
+    }
+
+    /** 输出格式按钮：选中时砖红底白字，未选中是浅底描边。 */
+    private TextView fmtPill(String text, final String key) {
+        TextView b = narrowPill(text);
+        b.setTag(key);
+        b.setOnClickListener(v -> {
+            if (!key.equals(outFmt)) {
+                outFmt = key;
+                getSharedPreferences("nihon", MODE_PRIVATE).edit().putString("fmt", outFmt).apply();
+                applyFmt();
+            }
+        });
+        return b;
+    }
+
+    private void applyFmt() {
+        for (TextView b : new TextView[]{fmtSrt, fmtLrc, fmtBoth}) {
+            if (b == null) {
+                continue;
+            }
+            boolean on = outFmt.equals(b.getTag());
+            b.setTextColor(on ? 0xFFFFFFFF : INK2);
+            b.setBackground(on ? round(ACCENT_DEEP, 22, 0, 0) : round(SUNK, 22, CARD_LINE, 1));
+        }
+    }
+
+    /** 字幕封装按钮：开软字幕前先弹一次说明，讲清会在原片旁多存一个文件。 */
+    private TextView softPill(String text, final String key) {
+        TextView b = narrowPill(text);
+        b.setTag(key);
+        b.setOnClickListener(v -> {
+            if (key.equals(softSub)) {
+                return;
+            }
+            if ("on".equals(key)) {
+                showSoftSubTip();
+            } else {
+                softSub = key;
+                getSharedPreferences("nihon", MODE_PRIVATE).edit().putString("soft", softSub).apply();
+                applySoft();
+            }
+        });
+        return b;
+    }
+
+    private void applySoft() {
+        for (TextView b : new TextView[]{softOff, softOn}) {
+            if (b == null) {
+                continue;
+            }
+            boolean on = softSub.equals(b.getTag());
+            b.setTextColor(on ? 0xFFFFFFFF : INK2);
+            b.setBackground(on ? round(ACCENT_DEEP, 22, 0, 0) : round(SUNK, 22, CARD_LINE, 1));
+        }
+        if (softHint != null) {
+            softHint.setText("on".equals(softSub)
+                    ? "会在原片旁另存一个 .mkv，字幕嵌在里面"
+                    : "字幕单独成文件，播放器里要自己选字幕");
+        }
+    }
+
+    /** 第一次开软字幕时把代价讲清楚（用户要求：必须提醒会多一个文件）。 */
+    private void showSoftSubTip() {
+        new android.app.AlertDialog.Builder(this)
+                .setTitle("开启软字幕")
+                .setMessage("不再单独留字幕文件，改为在原片旁另存一个 .mkv，"
+                        + "字幕嵌在视频里，播放器里可以开关。\n\n"
+                        + "· 不重新编码，体积和原片差不多\n"
+                        + "· 做完会问你要不要删掉原文件")
+                .setPositiveButton("开启", (d, w) -> {
+                    softSub = "on";
+                    getSharedPreferences("nihon", MODE_PRIVATE).edit().putString("soft", softSub).apply();
+                    applySoft();
+                })
+                .setNegativeButton("算了", null)
+                .show();
+    }
 
     private LinearLayout.LayoutParams third() {
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0,
@@ -1317,6 +1772,7 @@ public class MainActivity extends Activity {
     }
 
     private void refreshFiles() {
+        saveQueueState();   // 队列/状态一变就落盘：App 意外退出后靠它续跑
         fileBox.removeAllViews();
         int animIndex = 0;
         if (picked.isEmpty()) {
@@ -1390,6 +1846,66 @@ public class MainActivity extends Activity {
         File d = new File(appDir(), "bin");
         d.mkdirs();
         return d;
+    }
+
+    /**
+     * 清掉上一轮处理留在 bin/ 里的临时文件（提取的音频、分段、进度、错误输出）。
+     * run.sh 正常结束会自己清，这里兜底两种情况：
+     *   ① 被 kill -9 / App 被系统杀掉，trap 没机会跑；
+     *   ② 老版本跑完留了一堆。
+     * 启动、每次开跑前、每轮结束后各扫一遍 —— 不让 App 私有目录变成垃圾场。
+     */
+    private void cleanWorkFiles() {
+        File bin = new File(appDir(), "bin");   // 不走 binDir()，免得顺手 mkdirs
+        if (!bin.isDirectory()) return;
+        File[] items = bin.listFiles();
+        if (items == null) return;
+        long freed = 0;
+        int n = 0;
+        for (File x : items) {
+            String name = x.getName();
+            boolean junk = name.startsWith("_asmr_")
+                    || name.startsWith("_seg_")
+                    || name.equals("_asr_progress")
+                    || name.equals("_mt_progress")
+                    || name.equals("_sv_progress")
+                    || name.equals("_mt_preview")
+                    || name.equals("asr.err")
+                    // 老版本留下的「已解压」标记，只有当前这版有用
+                    || (name.startsWith(".assets_")
+                        && !name.equals(".assets_" + ASSETS_VER));
+            if (!junk) continue;
+            freed += sizeOf(x);
+            deleteTree(x);
+            n++;
+        }
+        // llama-server 是刻意驻留复用的，只有它真的不在了，pid 文件才算垃圾
+        File pid = new File(bin, "_llama.pid");
+        if (pid.isFile() && liveLlamaPid() <= 0) {
+            pid.delete();
+            n++;
+        }
+        if (n > 0) {
+            appendLog("[清理] 清掉 " + n + " 个上次残留的临时文件，释放 "
+                    + (freed / 1048576L) + " MB");
+        }
+    }
+
+    private static long sizeOf(File f) {
+        if (f.isFile()) return f.length();
+        File[] kids = f.listFiles();
+        if (kids == null) return 0;
+        long s = 0;
+        for (File k : kids) s += sizeOf(k);
+        return s;
+    }
+
+    private static void deleteTree(File f) {
+        if (f.isDirectory()) {
+            File[] kids = f.listFiles();
+            if (kids != null) for (File k : kids) deleteTree(k);
+        }
+        f.delete();
     }
 
     /** 字幕输出目录：app 的外部 files 目录，用户可用文件管理器访问。 */
@@ -1488,7 +2004,7 @@ public class MainActivity extends Activity {
     }
 
     /** assets 里的 run.sh 有改动时 +1，老设备靠这个戳记重新解压。 */
-    private static final String ASSETS_VER = "v9";
+    private static final String ASSETS_VER = "v18";
 
     private boolean binReady() {
         return new File(binDir(), ".assets_" + ASSETS_VER).isFile()
@@ -1527,12 +2043,43 @@ public class MainActivity extends Activity {
         stopping = false;
         curIdx = 0;
         fileProgress = 0f;
-        fileState.clear();
-        for (String p : picked) fileState.put(p, "待处理");
+        lastSpm = 0;
+        lastAsrDone = -1;
+        mtStartMs = 0;
+        lastAsrTotal = 0;
+        asrSamples.clear();
+        if (skipDoneFiles) {
+            // 续跑上次队列：已完成的保留，别重置成「待处理」
+            for (String p : picked) {
+                if (!fileState.containsKey(p)) fileState.put(p, "待处理");
+            }
+        } else {
+            fileState.clear();
+            for (String p : picked) fileState.put(p, "待处理");
+        }
+        if (pauseBtn != null) {
+            pauseBtn.setText("暂停");
+            pauseBtn.setEnabled(true);
+            pauseBtn.setAlpha(1f);
+        }
+        paused = false;
+        applyAsr();          // 跑起来就锁住识别模式
+        setQueueRunning(true);
         refreshFiles();
+        progress = 0f;         // 上一轮的 100% 必须先归零，setProgress 只会往上走
+        applyProgress();
         setProgress(0f, true);
         setStage("当前阶段　准备中");
         logView.setText("");
+        if (previewView != null) previewView.setText("正在准备…马上开始出字幕");
+        // 开新任务前再兜一次：哪怕上一轮是被 kill -9 干掉的，也不把残留带进这一轮
+        cleanWorkFiles();
+        deleteSoftList();
+        appendLog("[模式] 识别：" + ("zip".equals(asrMode) ? "zipformer 单模"
+                : ("sv".equals(asrMode) ? "SenseVoice 单模" : "融合（zipformer + SenseVoice）"))
+                + "；字幕：" + ("ja".equals(outLang) ? "仅日文" : "中文翻译")
+                + "；格式：" + ("srt".equals(outFmt) ? "SRT" : ("lrc".equals(outFmt) ? "LRC" : "SRT + LRC"))
+                + "；封装：" + ("on".equals(softSub) ? "软字幕 mkv" : "外挂字幕"));
 
         Thread t = new Thread(this::runPipeline, "pipeline");
         t.start();
@@ -1722,8 +2269,142 @@ public class MainActivity extends Activity {
         });
     }
 
+    // ── 暂停 / 继续 ─────────────────────────────────────
+    /**
+     * 冻结 / 解冻整条流水线。
+     * 不用「停了重来」那么伤：run.sh 及其拉起的 sherpa / llama 进程被 SIGSTOP 挂起，
+     * 内存里的进度（已识别的分段、已翻译的字幕）都还在，解冻后原地接着跑。
+     */
+    private void togglePause() {
+        if (!busy) return;
+        if (!paused) {
+            paused = true;
+            pauseBtn.setText("继续");
+            sendSignal(true);
+            appendLog("[暂停] 处理进程已冻结，点「继续」原地接着跑，进度不会丢");
+            setStage("当前阶段　已暂停");
+        } else {
+            paused = false;
+            pauseBtn.setText("暂停");
+            sendSignal(false);
+            appendLog("[继续] 已恢复处理");
+            setStage("当前阶段　处理中");
+        }
+    }
+
+    /** 对流水线里的所有进程发 SIGSTOP / SIGCONT（同 uid 才有权限，够用）。 */
+    private void sendSignal(final boolean freeze) {
+        final String sig = freeze ? "-STOP" : "-CONT";
+        new Thread(() -> {
+            java.util.Set<Long> pids = new java.util.LinkedHashSet<>();
+            long sh = liveShellPid();
+            if (sh > 0) pids.add(sh);
+            // run.sh 里的重活都在这些 native 进程里，必须一起冻、一起解
+            for (String name : new String[]{"libllamaserver.so", "libsherpaoffline.so",
+                    "libvadasr.so", "libffmpeg.so"}) {
+                long p = findPidByCmdline(name);
+                if (p > 0) pids.add(p);
+            }
+            int sent = 0;
+            for (long p : pids) {
+                try {
+                    Process k = new ProcessBuilder("/system/bin/kill", sig, String.valueOf(p))
+                            .redirectErrorStream(true).start();
+                    k.waitFor();
+                    sent++;
+                } catch (Exception ignored) {
+                }
+            }
+            final int n = sent;
+            ui.post(() -> appendLog("[暂停] " + (freeze ? "冻结" : "恢复") + "了 " + n + " 个处理进程"));
+        }, "pause-signal").start();
+    }
+
+    /** 当前 run.sh 进程的 pid；拿不到返回 -1。 */
+    private long liveShellPid() {
+        if (running == null) return -1;
+        try {
+            java.lang.reflect.Method m = Process.class.getMethod("pid");
+            Object v = m.invoke(running);
+            return v instanceof Long ? (Long) v : -1;
+        } catch (Exception e) {
+            return -1;
+        }
+    }
+
+    // ── 队列持久化（App 被系统杀掉后下次能续跑）────────────
+    /** 把队列 + 每个文件的状态写盘。「处理中」按「待处理」存，免得崩溃后卡在中间态。 */
+    private void saveQueueState() {
+        StringBuilder sb = new StringBuilder();
+        for (String p : picked) {
+            String st = stateOf(p);
+            if ("处理中".equals(st) || "已停止".equals(st)) st = "待处理";
+            sb.append(st).append('\t').append(p).append('\n');
+        }
+        getSharedPreferences(QPREF, MODE_PRIVATE).edit()
+                .putString("files", sb.toString()).apply();
+    }
+
+    /** 单独标记「队列进行中」；只有 start / finishRun 改它，避免刷新列表时误清。 */
+    private void setQueueRunning(boolean r) {
+        getSharedPreferences(QPREF, MODE_PRIVATE).edit().putBoolean("running", r).apply();
+    }
+
+    /** 上次队列没跑完 → 弹窗问要不要接着跑，已完成的自动跳过。 */
+    private void promptResumeQueue() {
+        if (busy) return;
+        if (!resumeWasRunning) return;
+        resumeWasRunning = false;      // 只提示一次
+        String raw = resumeFilesRaw;
+        if (raw == null || raw.isEmpty()) return;
+        final java.util.List<String[]> rows = new java.util.ArrayList<>();
+        int doneN = 0, leftN = 0;
+        for (String line : raw.split("\n")) {
+            if (line.isEmpty()) continue;
+            int t = line.indexOf('\t');
+            if (t <= 0) continue;
+            String st = line.substring(0, t);
+            String path = line.substring(t + 1);
+            if (!new File(path).exists()) continue;   // 文件被删了就别提
+            rows.add(new String[]{path, "完成".equals(st) ? "完成" : "待处理"});
+            if ("完成".equals(st)) doneN++; else leftN++;
+        }
+        if (rows.isEmpty() || leftN == 0) {
+            setQueueRunning(false);
+            return;
+        }
+        final int total = rows.size(), done = doneN, left = leftN;
+        new android.app.AlertDialog.Builder(this)
+                .setTitle("继续上次队列")
+                .setMessage("上次队列没跑完：共 " + total + " 个文件，已完成 " + done + " 个，还有 "
+                        + left + " 个没处理。\n\n点「继续」接着跑，已完成的会自动跳过。")
+                .setPositiveButton("继续", (d, w) -> {
+                    picked.clear();
+                    fileState.clear();
+                    for (String[] r : rows) {
+                        picked.add(r[0]);
+                        fileState.put(r[0], r[1]);
+                    }
+                    skipDoneFiles = true;
+                    refreshFiles();
+                    refreshQueue();
+                    start();
+                })
+                .setNegativeButton("忽略", (d, w) -> {
+                    setQueueRunning(false);
+                    appendLog("[队列] 已忽略上次没跑完的任务");
+                })
+                .setCancelable(true)
+                .show();
+    }
+
     private void stop() {
         stopping = true;
+        if (paused) {           // 冻结状态下也能杀，但先解冻更干净
+            paused = false;
+            if (pauseBtn != null) pauseBtn.setText("暂停");
+            sendSignal(false);
+        }
         if (running != null) {
             try {
                 running.destroy();
@@ -1811,6 +2492,10 @@ public class MainActivity extends Activity {
             int idx = 0;
             for (String file : snapshot) {
                 if (stopping) break;
+                if (skipDoneFiles && "完成".equals(stateOf(file))) {
+                    appendLog("[跳过] " + new File(file).getName() + " 上次已经完成");
+                    continue;
+                }
                 final int fi = idx;
                 curIdx = fi;
                 curFile = file;
@@ -1830,11 +2515,14 @@ public class MainActivity extends Activity {
                 File srcDir = new File(file).getParentFile();
                 File outDir = (hasAllFiles() && srcDir != null && srcDir.canWrite())
                         ? srcDir : outputDir();
-                File outSrt = new File(outDir, stem + ".chs.srt");
+                // 仅日文时用 .ja.srt/.ja.lrc，播放器能按后缀选语言
+                String langSuffix = "ja".equals(outLang) ? ".ja" : ".chs";
+                File outSrt = new File(outDir, stem + langSuffix + ".srt");
                 String outKey = outDir.getAbsolutePath() + "/" + outSrt.getName();
                 int dup = 2;
-                while (usedOut.contains(outKey)) {
-                    outSrt = new File(outDir, stem + "-" + dup + ".chs.srt");
+                while (usedOut.contains(outKey) || outSrt.exists()
+                        || new File(outDir, srtToLrcName(outSrt.getName())).exists()) {
+                    outSrt = new File(outDir, stem + "-" + dup + langSuffix + ".srt");
                     outKey = outDir.getAbsolutePath() + "/" + outSrt.getName();
                     dup++;
                 }
@@ -1844,8 +2532,11 @@ public class MainActivity extends Activity {
                 // 原方案是先用系统 MediaCodec 解码再喂给脚本（为了只带 ffmpeg 当兜底），
                 // 实测 90 秒音频要 2.8 秒、91 分钟片子要 2.9 分钟，而 ffmpeg 只要约 30 秒 —— 慢 5.7 倍，
                 // 用户明确否决，所以回到 ffmpeg 一把到底。
+                // 第二个参数只给「输出目录」，字幕文件名由 run.sh 用输入文件的真实 basename 推导：
+                // App 队列里可能存着改名前的旧路径（曾出现过视频名少一个 @、字幕名多一个 @，
+                // 结果播放器按名匹配不到字幕），让脚本自己算就不会错。
                 ProcessBuilder pb = new ProcessBuilder(
-                        "/system/bin/sh", script.getAbsolutePath(), file, outSrt.getAbsolutePath());
+                        "/system/bin/sh", script.getAbsolutePath(), file, outDir.getAbsolutePath());
                 pb.directory(bin);
                 pb.redirectErrorStream(true);
                 pb.environment().put("LD_LIBRARY_PATH", getApplicationInfo().nativeLibraryDir);
@@ -1853,6 +2544,11 @@ public class MainActivity extends Activity {
                 pb.environment().put("ASMR_WORK", bin.getAbsolutePath());
                 // 模型在私有目录（run.sh 优先用它，找不到才回落到 /sdcard）
                 pb.environment().put("ASMR_MODEL", modelDir().getAbsolutePath());
+        pb.environment().put("ASMR_FMT", outFmt);
+        pb.environment().put("ASMR_SUFFIX", langSuffix);
+        pb.environment().put("ASMR_SOFTSUB", "on".equals(softSub) ? "1" : "0");
+        pb.environment().put("ASMR_LANG", outLang);
+        pb.environment().put("ASMR_ASR", asrMode);
                 running = pb.start();
                 try (BufferedReader r = new BufferedReader(
                         new InputStreamReader(running.getInputStream()))) {
@@ -1881,6 +2577,114 @@ public class MainActivity extends Activity {
         }
     }
 
+    // ── 字幕预览 ────────────────────────────────────────
+    /**
+     * 只读、只取尾部：翻译阶段看 native 每句追加的 _mt_preview；
+     * 识别阶段看 sherpa 写的 JSON 行（每行一个 {"text": ...}）。
+     * 两个都没有就保持原样（不把「等待中」刷来刷去）。
+     */
+    private void updatePreview() {
+        if (previewView == null) return;
+        String text = null;
+        java.util.List<String> rows = new java.util.ArrayList<>();
+        File mpv = new File(binDir(), "_mt_preview");
+        if (mpv.isFile() && mpv.length() > 0) {
+            for (String ln : readTailLines(mpv, 80)) {
+                String[] p = ln.split("\t");
+                if (p.length < 4) continue;
+                String zh = p[3].trim();
+                if (zh.isEmpty()) continue;
+                rows.add(fmtClock(p[0]) + "　" + zh);
+            }
+        } else {
+            // 识别阶段：日文原文先垫着，让用户看到确实在出东西
+            File zf = newestAsrJson();
+            if (zf != null && zf.length() > 0) {
+                for (String ln : readTailLines(zf, 400)) {
+                    String s = ln.trim();
+                    if (!s.startsWith("{")) continue;
+                    try {
+                        String txt = new org.json.JSONObject(s).optString("text", "").trim();
+                        if (!txt.isEmpty()) rows.add("· " + txt);
+                    } catch (Exception ignored) {
+                    }
+                }
+            }
+        }
+        if (rows.isEmpty()) return;
+        int from = Math.max(0, rows.size() - 7);
+        StringBuilder sb = new StringBuilder();
+        for (int i = from; i < rows.size(); i++) {
+            if (i > from) sb.append('\n');
+            sb.append(rows.get(i));
+        }
+        text = sb.toString();
+        final String t = text;
+        ui.post(() -> {
+            if (previewView == null) return;
+            if (!t.equals(previewView.getText().toString())) {
+                previewView.setText(t);
+                // 自动滚到最新一句
+                if (previewScroll != null) previewScroll.post(
+                        () -> previewScroll.fullScroll(View.FOCUS_DOWN));
+            }
+        });
+    }
+
+    /** 翻译预览文件的最后一句结束时间（秒），用来算倍速；没有就返回 -1。 */
+    private double lastPreviewEnd() {
+        java.util.List<String> lines = readTailLines(new File(binDir(), "_mt_preview"), 12);
+        for (int i = lines.size() - 1; i >= 0; i--) {
+            String[] a = lines.get(i).split("\t");
+            if (a.length >= 4) {
+                try {
+                    return Double.parseDouble(a[1].trim());
+                } catch (Exception ignored) {
+                }
+            }
+        }
+        return -1;
+    }
+
+    /** 读文件的最后 n 行（文件都很小，直接整读再切）。 */
+    private static java.util.List<String> readTailLines(File f, int n) {
+        java.util.List<String> out = new java.util.ArrayList<>();
+        try {
+            String all = new String(java.nio.file.Files.readAllBytes(f.toPath()),
+                    java.nio.charset.StandardCharsets.UTF_8);
+            String[] parts = all.split("\n");
+            for (int i = Math.max(0, parts.length - n); i < parts.length; i++) {
+                if (!parts[i].trim().isEmpty()) out.add(parts[i]);
+            }
+        } catch (Exception ignored) {
+        }
+        return out;
+    }
+
+    /** 本次任务里最新的识别结果文件（融合用 _zip.txt，单车道用 _asmr_pid.txt）。 */
+    private File newestAsrJson() {
+        File[] fs = binDir().listFiles();
+        if (fs == null) return null;
+        File best = null;
+        for (File f : fs) {
+            String n = f.getName();
+            if (!n.startsWith("_asmr_") || !n.endsWith(".txt")) continue;
+            if (n.endsWith("_sv.txt") || n.endsWith("_dumb.txt")) continue;
+            if (best == null || f.lastModified() > best.lastModified()) best = f;
+        }
+        return best;
+    }
+
+    private static String fmtClock(String sec) {
+        double d;
+        try {
+            d = Double.parseDouble(sec);
+        } catch (Exception e) {
+            return "--:--";
+        }
+        int t = (int) Math.max(0, d);
+        return String.format(java.util.Locale.ROOT, "%02d:%02d", t / 60, t % 60);
+    }
     /** 解析子进程输出 → 阶段文字 + 进度条 + 日志。 */
     private void onLine(String line) {
         if (line.startsWith("[1/4]")) {
@@ -1890,10 +2694,10 @@ public class MainActivity extends Activity {
             setFileProgress(0.18f, true);
             setStage("当前阶段　语音识别");
         } else if (line.startsWith("[3/4]")) {
-            setFileProgress(0.30f, true);
-            setStage("当前阶段　语音识别（进行中）");
+            setFileProgress(0.62f, true);
+            setStage("当前阶段　启动翻译服务");
         } else if (line.startsWith("[4/4]")) {
-            setFileProgress(0.72f, true);
+            setFileProgress(0.74f, true);
             setStage("当前阶段　翻译");
         }
         if (line.contains("listening on")) {
@@ -1924,10 +2728,19 @@ public class MainActivity extends Activity {
         stopKeepAlive();
         busy = false;
         running = null;
+        paused = false;
+        skipDoneFiles = false;
+        setQueueRunning(false);
+        if (pauseBtn != null) {
+            pauseBtn.setText("暂停");
+            pauseBtn.setEnabled(false);
+            pauseBtn.setAlpha(0.4f);
+        }
         startBtn.setEnabled(true);
         startBtn.setAlpha(1f);
         stopBtn.setEnabled(false);
         stopBtn.setAlpha(0.4f);
+        applyAsr();          // 任务结束，识别模式重新可选
         int done = 0;
         for (String st : fileState.values()) {
             if ("完成".equals(st)) done++;
@@ -1943,6 +2756,72 @@ public class MainActivity extends Activity {
             setStage("当前阶段　已停止");
             subtitleView.setText("本地转写 · 离线翻译 · 手机 CPU 推理");
         }
+        // 正常结束时 run.sh 自己已清干净，这里再扫一遍只是兜底，通常没有输出
+        cleanWorkFiles();
+        promptDeleteSources();
+    }
+
+    /** 上一轮遗留的软字幕清单，开新任务前清掉。 */
+    private void deleteSoftList() {
+        File f = new File(binDir(), "_soft_list");
+        if (f.exists()) {
+            f.delete();
+        }
+    }
+
+    /** 队列跑完后问一次：带字幕的 .mkv 已经生成，要不要把原视频删掉。 */
+    private void promptDeleteSources() {
+        final File listFile = new File(binDir(), "_soft_list");
+        if (!listFile.isFile()) {
+            return;
+        }
+        final java.util.List<String[]> pairs = new ArrayList<>();
+        try (BufferedReader r = new BufferedReader(new InputStreamReader(
+                new java.io.FileInputStream(listFile), "UTF-8"))) {
+            String line;
+            while ((line = r.readLine()) != null) {
+                int bar = line.lastIndexOf('|');
+                if (bar <= 0) {
+                    continue;
+                }
+                String src = line.substring(0, bar);
+                String mkv = line.substring(bar + 1);
+                // 只有 mkv 真的写出来了才建议删源，避免把片子删了字幕却没成
+                if (new File(mkv).isFile()) {
+                    pairs.add(new String[]{src, mkv});
+                }
+            }
+        } catch (Exception ignored) {
+        }
+        listFile.delete();
+        if (pairs.isEmpty()) {
+            return;
+        }
+        final StringBuilder sb = new StringBuilder();
+        sb.append("已生成 ").append(pairs.size()).append(" 个带字幕的文件（.mkv）：\n");
+        for (int i = 0; i < Math.min(4, pairs.size()); i++) {
+            sb.append("· ").append(new File(pairs.get(i)[1]).getName()).append("\n");
+        }
+        if (pairs.size() > 4) {
+            sb.append("…\n");
+        }
+        sb.append("\n对应的原文件还留着，比较占地方。要删掉吗？\n"
+                + "字幕已经嵌在 .mkv 里，删了照样能看。");
+        ui.post(() -> new android.app.AlertDialog.Builder(this)
+                .setTitle("删掉原文件？")
+                .setMessage(sb.toString())
+                .setPositiveButton("删掉原文件", (d, w) -> {
+                    int n = 0;
+                    for (String[] pr : pairs) {
+                        if (new File(pr[0]).delete()) {
+                            n++;
+                        }
+                    }
+                    appendLog("[清理] 删掉了 " + n + " 个原文件，只保留带字幕的 .mkv");
+                    toast("已删除 " + n + " 个原文件");
+                })
+                .setNegativeButton("都留着", null)
+                .show());
     }
 
     // ── 运行状态轮询（进度卡「运行状态」行）────────────────────
@@ -1958,7 +2837,9 @@ public class MainActivity extends Activity {
     private volatile double metPrevPrompt = -1.0, metPrevPredicted = -1.0, metPrevMs = 0.0;
 
     private static final int STATS_INTERVAL_MS = 2000;
-    private static final String STATS_IDLE = "运行状态　—";
+    /** 运行日志保留行数上限；超出后丢最早的，并在首行留一句提示。 */
+    private static final int LOG_MAX_LINES = 300;
+    private static final String STATS_IDLE = "运行状态　空闲";
 
     private void startStats() {
         stopStats();
@@ -1991,6 +2872,17 @@ public class MainActivity extends Activity {
         try { Thread.sleep(1500L); } catch (InterruptedException e) { return; }
         while (!Thread.currentThread().isInterrupted()) {
             try {
+                if (paused) {   // 冻结期间别把「已暂停」刷掉
+                    final int genp = statsGen;
+                    ui.post(() -> {
+                        if (statView != null && statsRunning && genp == statsGen) {
+                            statView.setText("运行状态　已暂停（点「继续」恢复）");
+                        }
+                    });
+                    Thread.sleep(STATS_INTERVAL_MS);
+                    continue;
+                }
+                updatePreview();
                 final String text = collectStats();
                 final int gen = statsGen;
                 // 调试用：文本 + 三条数据源状态进 logcat，真机用 logcat 精确采样
@@ -1998,7 +2890,13 @@ public class MainActivity extends Activity {
                 Log.i("AsmrStats", text + "  [metric=" + lastMetricErr
                         + " proc=" + lastProcErr + " freq=" + lastFreqOk + "]");
                 ui.post(() -> {
+                    if (statsRunning && gen == statsGen) applySegProgress();
                     if (statView != null && statsRunning && gen == statsGen) statView.setText(text);
+                    // 队列页开着时同步那行状态（关着就是空转，代价可忽略）
+                    if (queueLive != null && queueOverlay != null
+                            && queueOverlay.getVisibility() == View.VISIBLE) {
+                        syncQueueLive();
+                    }
                 });
                 // collectStats 内部三路各自 catch、几乎不抛异常，所以「失败」必须看三路结果，
                 // 不能只看异常：否则 fails 恒 0，线程永不自愈退出。
@@ -2023,11 +2921,70 @@ public class MainActivity extends Activity {
         }
     }
 
+    /** 读 "done total" 形式的进度文件，返回 {done,total}；读不到返回 {-1,-1}。 */
+    /** 组装「识别 k/N 段（x 段/分 · y× 实时，剩约 z 分）」；spm 太小时沿用上一次的值。 */
+    private String segText(int done, int total, double spm) {
+        StringBuilder b = new StringBuilder("运行状态　识别 ");
+        b.append(done).append("/").append(total).append(" 段");
+        double sp = spm > 0.5 ? spm : lastSpm;
+        if (sp > 0.5) {
+            int leftMin = (int) Math.ceil(Math.max(0, total - done) / sp);
+            // 每段 20 秒音频（run.sh 的 SEG_SEC=20）：
+            //   spm 段/分 → 每分钟消化 spm*20 秒音频 → 倍速 = spm*20/60
+            b.append(String.format(java.util.Locale.ROOT,
+                    "（%.0f 段/分 · %.1f× 实时，剩约 %d 分）",
+                    sp, sp * 20.0 / 60.0, leftMin));
+        }
+        return b.toString();
+    }
+
+    private int[] readSegProgress(String name) {
+        String pr = readOneLine(new File(binDir(), name).getAbsolutePath());
+        if (pr != null) {
+            String[] a = pr.trim().split("\\s+");
+            if (a.length >= 2) {
+                try {
+                    return new int[]{Integer.parseInt(a[0]), Integer.parseInt(a[1])};
+                } catch (Exception ignore) { }
+            }
+        }
+        return new int[]{-1, -1};
+    }
+
+    /** 把「第几段 / 共几段」写到阶段文字，并让进度条按比例走（在 UI 线程调用）。 */
+    private void applySegProgress() {
+        if (!statsRunning || segPhase == null || segTotal <= 0 || segDone < 0) return;
+        float r = Math.min(1f, segDone / (float) segTotal);
+        if ("asr".equals(segPhase)) {
+            setStage("当前阶段　语音识别 " + segDone + "/" + segTotal + " 段");
+            // 0.18 起步（[2/4] 的位置）；主车道到 0.52，剩下的 0.10 留给补车道
+            setFileProgress(0.18f + 0.34f * r, false);
+        } else if ("sv".equals(segPhase)) {
+            setStage("当前阶段　补车道 " + segDone + "/" + segTotal + " 窗");
+            setFileProgress(0.52f + 0.10f * r, false);
+        } else if ("mt".equals(segPhase)) {
+            setStage("当前阶段　翻译 " + segDone + "/" + segTotal + " 段");
+            setFileProgress(0.74f + 0.25f * r, false);
+        }
+    }
+
     /** 最近一轮三条数据源各自的成功情况，只进 logcat，不上界面。 */
     private String lastMetricErr = "-", lastProcErr = "-", lastFreqOk = "-";
 
     private String collectStats() throws Exception {
         StringBuilder sb = new StringBuilder();
+
+        // 进程发现：识别阶段跑的是 libsherpaoffline.so，翻译阶段才是 libllamaserver.so。
+        // 之前只看 _llama.pid，而翻译服务现在故意推迟到识别之后才起，
+        // 于是整段识别期间都会显示「模型 未启动」+ 没有核数——用户以为卡死（实测反馈）。
+        // _llama.pid 在上一次任务结束后不会删（翻译服务是刻意驻留复用的），
+        // 所以它可能指向一个早就死掉的 pid：这时如果还当它活着，识别阶段就永远不会去扫 sherpa，
+        // 界面整段显示「模型 未启动」（实测 ja150.wav 就踩到了）。必须先校验 pid 真的还在。
+        // 翻译服务在上一次任务结束后会刻意驻留（复用，省 30~60 秒加载），
+        // 于是识别阶段 llamaPid 也是「活的」，会盖住 sherpa，界面就显示成「模型 写0.0/读0 t/s」。
+        // 必须先找 sherpa，它才是识别阶段真正干活的进程。
+        long sherpaPid = findPidByCmdline("libsherpaoffline.so");
+        long llamaPid = sherpaPid > 0 ? -1 : liveLlamaPid();
 
         // ① 模型吞吐：/metrics 是 Prometheus 文本，取两个累计计数做差
         //    注意 prompt_tokens_total 在 1.8B 模型上每秒可达数百，写成整数位
@@ -2038,7 +2995,15 @@ public class MainActivity extends Activity {
         } catch (Exception e) {
             lastMetricErr = e.getClass().getSimpleName() + ":" + e.getMessage();
         }
-        if (m != null && m.indexOf("prompt_tokens_total") >= 0) {
+        if (m != null && m.indexOf("prompt_tokens_total") >= 0 && fileProgress >= 0.62f) {
+            int[] mp2 = readSegProgress("_mt_progress");
+            if (mp2[1] > 0) {
+                segPhase = "mt";
+                segDone = mp2[0];
+                segTotal = mp2[1];
+            } else {
+                segPhase = null;
+            }
             double prompt = metricValue(m, "prompt_tokens_total");
             double predict = metricValue(m, "tokens_predicted_total");
             long now = System.currentTimeMillis();
@@ -2056,41 +3021,96 @@ public class MainActivity extends Activity {
             } else {
                 sb.append("运行状态　模型 空闲");
             }
+            // 翻译阶段的倍速：_mt_preview 最后一行的结束时间就是「已经翻到第几秒的音频」，
+            // 除以翻译真正用掉的时间就是相对实时的倍数（用户 m08385 要求）。
+            double audioEnd = lastPreviewEnd();
+            if (audioEnd > 0) {
+                if (mtStartMs == 0) mtStartMs = now;
+                double elapsed = (now - mtStartMs) / 1000.0;
+                if (elapsed > 3) {
+                    sb.append(String.format(java.util.Locale.ROOT, "　%.1f× 实时（已到 %s）",
+                            audioEnd / elapsed, fmtClock(String.valueOf(audioEnd))));
+                }
+            }
             // 无论走哪个分支都重建基准（restarted 时尤其重要）
             if (prompt >= 0) {
                 metPrevPrompt = prompt;
                 metPrevPredicted = predict;
                 metPrevMs = now;
             }
+        } else if (sherpaPid > 0) {
+            // 识别阶段没有 llama 的 /metrics，速度改从 run.sh 写的进度文件算：
+            //   _asr_progress = "<已完成段数> <总段数>"
+            // 融合模式的补车道（一窗一进程补 SenseVoice）另写 _sv_progress，
+            // 主车道的 _asr_progress 在补漏期间早就写满，不读它数字就完全不动。
+            int[] svs = readSegProgress("_sv_progress");
+            int[] pp = readSegProgress("_asr_progress");
+            int done = pp[0], total = pp[1];
+            if (svs[0] >= 0 && svs[1] > 0 && svs[0] < svs[1]) {
+                segPhase = "sv";
+                segDone = svs[0];
+                segTotal = svs[1];
+                sb.append("运行状态　补车道 ").append(svs[0]).append("/").append(svs[1])
+                        .append(" 窗（SenseVoice 补漏，一窗一进程较慢）");
+            } else {
+            segPhase = "asr";
+            segDone = done;
+            segTotal = total;
+            if (done >= 0 && total > 0) {
+                long now = System.currentTimeMillis();
+                if (asrSamples.isEmpty() || asrSamples.peekLast()[1] != done) {
+                    asrSamples.addLast(new long[]{now, done});
+                }
+                while (asrSamples.size() > 2 && now - asrSamples.peekFirst()[0] > 60000L) {
+                    asrSamples.removeFirst();
+                }
+                double spm = 0;
+                long[] first = asrSamples.peekFirst();
+                long[] last = asrSamples.peekLast();
+                if (first != null && last != null && last[0] - first[0] >= 10000L
+                        && last[1] > first[1]) {
+                    spm = (last[1] - first[1]) / ((last[0] - first[0]) / 60000.0);
+                }
+                if (spm > 0.5) lastSpm = spm;
+                lastAsrDone = done;
+                lastAsrTotal = total;
+                sb.append(segText(done, total, spm));
+            } else if (lastAsrTotal > 0) {
+                // 进度文件还没写出来，先沿用上一轮的读数，别突然变成没有速度
+                sb.append(segText(lastAsrDone, lastAsrTotal, 0));
+            } else {
+                sb.append("运行状态　识别中（翻译服务识别完才加载）");
+            }
+            }
         } else {
-            sb.append("运行状态　模型 未启动");
+            segPhase = null;
+            // 没有推理进程在跑 ≠ 没在干活：ffmpeg 提取音频、模型加载间隙都是这个状态。
+            // 以前一律写「模型 未启动」，用户以为任务压根没启动（实测反馈），按进度区间说清楚。
+            if (!busy) {
+                sb.append("运行状态　空闲");
+            } else if (fileProgress < 0.18f) {
+                sb.append("运行状态　正在提取音频（ffmpeg）");
+            } else if (fileProgress < 0.62f && lastAsrTotal > 0) {
+                // 批次间隙 sherpa 退出重启，读数照旧，速度不许闪
+                sb.append(segText(lastAsrDone, lastAsrTotal, 0));
+            } else if (fileProgress < 0.62f) {
+                sb.append("运行状态　正在启动识别模型…");
+            } else if (fileProgress < 0.74f) {
+                sb.append("运行状态　正在加载翻译模型（约 2 GB，要 30~90 秒）");
+            } else {
+                sb.append("运行状态　正在生成字幕…");
+            }
         }
 
-        // ② 占用核数：utime+stime（单位 1/100s）差 ÷ 墙钟差
+        // ② 进程存活探测。以前这里还算「占用几核」并显示，用户反馈占屏幕位置，已去掉显示；
+        //    仍探一次 /proc/<pid>/stat，因为 statsLoop 的「三路都失败就自愈退出」靠 lastProcErr 判断。
         try {
-            String pidS = readOneLine(new File(binDir(), "_llama.pid").getAbsolutePath());
-            if (pidS == null) {
-                lastProcErr = "读不到 _llama.pid";
-            } else {
-                long pid = Long.parseLong(pidS.trim().split("\\s+")[0]);
+            long pid = llamaPid > 0 ? llamaPid : sherpaPid;
+            if (pid > 0) {
                 String st = readOneLine("/proc/" + pid + "/stat");
                 lastProcErr = (st == null ? "读不到 /proc/" + pid + "/stat" : "ok");
-                if (st != null) {
-                    // 格式：pid (comm) state ppid ... 第14/15字段是 utime/stime；comm 可能含空格，
-                    // 所以从最后一个 ')' 之后开始切
-                    int close = st.lastIndexOf(')');
-                    String[] f = st.substring(close + 1).trim().split("\\s+");
-                    // f[0]=state(第3字段)，utime 是第14字段 → f[11]，stime f[12]
-                    long ticks = Long.parseLong(f[11]) + Long.parseLong(f[12]);
-                    long now = System.currentTimeMillis();
-                    if (cpuPrevTicks >= 0 && cpuPrevMs > 0 && now > cpuPrevMs) {
-                        double cores = (ticks - cpuPrevTicks) * 10.0 / (now - cpuPrevMs);
-                        if (cores >= 0) sb.append(String.format(java.util.Locale.ROOT,
-                                "  %.1f核", Math.min(cores, 99)));
-                    }
-                    cpuPrevTicks = ticks;
-                    cpuPrevMs = now;
-                }
+            } else {
+                lastProcErr = "找不到推理进程";
             }
         } catch (Exception ignore) { }
 
@@ -2107,7 +3127,12 @@ public class MainActivity extends Activity {
             } catch (Exception ignore) { }
         }
         if (max > 0) {
-            sb.append(String.format(java.util.Locale.ROOT, "  大核%.1f-%.1fG", min / 1e6, max / 1e6));
+            // 只报大核最高档就够了，写「2.6-2.6G」白占半行
+            if (Math.abs(max - min) < 100000) {
+                sb.append(String.format(java.util.Locale.ROOT, "  大核%.1fG", max / 1e6));
+            } else {
+                sb.append(String.format(java.util.Locale.ROOT, "  大核%.1f~%.1fG", min / 1e6, max / 1e6));
+            }
             lastFreqOk = (min / 1e6) + "-" + (max / 1e6);
         } else {
             lastFreqOk = "none";
@@ -2409,6 +3434,37 @@ public class MainActivity extends Activity {
         }
     }
 
+    /** 读 pid 文件（内容可能带参数），失败返回 -1。 */
+    private static long readPidFile(String p) {
+        String s = readOneLine(p);
+        if (s == null || s.isEmpty()) return -1;
+        try { return Long.parseLong(s.trim().split("\\s+")[0]); } catch (Exception e) { return -1; }
+    }
+
+    /** 读 _llama.pid 并校验那个 pid 现在确实是翻译服务；进程已退/被复用就返回 -1。 */
+    private long liveLlamaPid() {
+        long pid = readPidFile(new File(binDir(), "_llama.pid").getAbsolutePath());
+        if (pid <= 0) return -1;
+        String c = readOneLine("/proc/" + pid + "/cmdline");
+        return (c != null && c.contains("libllamaserver")) ? pid : -1;
+    }
+
+    /** 扫 /proc/<pid>/cmdline 找进程（只用于界面展示，找不到就返回 -1）。 */
+    private static long findPidByCmdline(String needle) {
+        java.io.File[] dirs = new java.io.File("/proc").listFiles();
+        if (dirs == null) return -1;
+        for (java.io.File d : dirs) {
+            String name = d.getName();
+            if (name.isEmpty() || !Character.isDigit(name.charAt(0))) continue;
+            String cmd = readOneLine(d.getPath() + "/cmdline");
+            // cmdline 用 \0 分隔，直接整串 contains 判断即可（旧版本写成含 NUL 的整串）
+            if (cmd != null && cmd.contains(needle)) {
+                try { return Long.parseLong(name); } catch (Exception ignore) { }
+            }
+        }
+        return -1;
+    }
+
     /** 阶段文字淡出→换 →淡入，避免硬切跳变。 */
     private void setStage(final String text) {
         if (stageView == null) return;
@@ -2512,6 +3568,28 @@ public class MainActivity extends Activity {
         }
     }
 
+    /** 把「运行日志」里现有内容导出成 txt 存到 Download 目录，方便发给开发者排查 */
+    private void exportLog() {
+        String text = logView == null ? "" : logView.getText().toString();
+        if (text.trim().isEmpty()) { toast("日志是空的"); return; }
+        String name = "nihonsubs-log-"
+                + new java.text.SimpleDateFormat("MMdd-HHmmss", java.util.Locale.ROOT)
+                        .format(new java.util.Date()) + ".txt";
+        java.io.File dir = new java.io.File(android.os.Environment.getExternalStorageDirectory(), "Download");
+        java.io.File f = new java.io.File(dir, name);
+        try {
+            if (!dir.isDirectory()) dir.mkdirs();
+            java.io.FileOutputStream out = new java.io.FileOutputStream(f);
+            out.write(text.getBytes("UTF-8"));
+            out.flush();
+            out.close();
+            appendLog("[日志] 已导出：" + f.getAbsolutePath());
+            toast("已导出到 Download/" + name);
+        } catch (Exception e) {
+            toast("导出失败：" + e.getMessage());
+        }
+    }
+
     private void appendLog(String line) {
         // runPipeline 在后台线程调用：直接改 View 会抛 CalledFromWrongThreadException，
         // 一抛就把整条流水线的异常路径带歪（日志只剩第一行），所以统一切回主线程。
@@ -2522,11 +3600,14 @@ public class MainActivity extends Activity {
         CharSequence old = logView.getText();
         String text = old.length() == 0 ? line : (old + "\n" + line);
         String[] lines = text.split("\n");
-        if (lines.length > 400) {
-            StringBuilder sb = new StringBuilder();
-            for (int k = lines.length - 400; k < lines.length; k++) {
-                if (sb.length() > 0) sb.append('\n');
-                sb.append(lines[k]);
+        // 日志只留最近的 LOG_MAX_LINES 行：跑长片子时日志会一直涨，
+        // 全量留在 TextView 里既拖慢重绘，也让「导出」出来一大坨没人看。
+        if (lines.length > LOG_MAX_LINES) {
+            final int keep = LOG_MAX_LINES - 1;   // 留一行给提示
+            StringBuilder sb = new StringBuilder("…（较早的日志已自动清理，只保留最近 ")
+                    .append(keep).append(" 行，完整记录点「导出」）");
+            for (int k = lines.length - keep; k < lines.length; k++) {
+                sb.append('\n').append(lines[k]);
             }
             text = sb.toString();
         }

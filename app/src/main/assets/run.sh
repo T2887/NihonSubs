@@ -2,7 +2,8 @@
 # 手机端一键字幕：媒体文件 -> 16k wav -> 切段 + SenseVoice -> Hy-MT2 翻译 -> SRT+LRC
 #
 # 用法（在手机上）：
-#     sh run.sh <输入文件> [输出.srt]（产物成对：<同名>.chs.srt 与 <同名>.chs.lrc）
+#     sh run.sh <输入文件> [输出.srt]（产物：<同名>.chs.srt 与 <同名>.chs.lrc，
+#     由 ASMR_FMT=srt|lrc|both 决定留哪份，默认 both）
 #
 # 依赖（可执行文件在 nativeLibraryDir 里，改名成 libXXX.so 才能 exec）：
 #     libffmpeg.so  libsherpaoffline.so  libasmrmobile.so  libllamaserver.so
@@ -118,6 +119,15 @@ fi
 NICE="nice -n 10"
 command -v nice > /dev/null 2>&1 || NICE=""
 
+# 每批窗口数（2026-11-11 实测，别随手改大）：libsherpaoffline.so 的内存是**按批累积**的，
+# 单进程峰值实测 1 段 461 MB / 3 段 835 MB / 6 段 1410 MB（约每段 +190 MB，不释放）。
+# 24 段一批时真机跑到过 2.5~4.1 GB，把 7.6 GB 机器顶穿（SwapFree 归 0、kswapd0 96%、
+# iow 528%、整机 ANR）。取 4 段一批（约 1.0 GB 峰值），代价只是模型多加载几次。
+# 可用 ASMR_BATCH 覆盖（上限 8）。
+BATCH="${ASMR_BATCH:-4}"
+case "$BATCH" in ''|*[!0-9]*|0) BATCH=4 ;; esac
+[ "$BATCH" -gt 8 ] && BATCH=8
+
 IN="$1"
 if [ -z "$IN" ]; then
     echo "用法: sh $0 <输入媒体文件> [输出.srt]"
@@ -130,10 +140,26 @@ fi
 
 BASE=$(basename "$IN")
 STEM=${BASE%.*}
-OUT="$2"
-if [ -z "$OUT" ]; then
-    OUT="$(dirname "$IN")/$STEM.chs.srt"
+# 输出名一律从输入文件的真实文件名推导。
+# 曾经由 App 拼好路径传进来，结果队列里存着旧路径（例如视频改名后仍留着带 @ 的名字），
+# 生成的字幕和磁盘上的视频名对不上，播放器就找不到同名字幕 → 只能手选。
+OUTDIR="$2"
+SUF="${ASMR_SUFFIX:-.chs}"
+if [ -n "$OUTDIR" ] && [ "${OUTDIR%.srt}" != "$OUTDIR" ]; then
+    OUT="$OUTDIR"                                   # 兼容旧调用：第二参数直接给 .srt
+elif [ -n "$OUTDIR" ]; then
+    OUT="$OUTDIR/$STEM$SUF.srt"                     # 只给目录，名字自己算
+else
+    OUT="$(dirname "$IN")/$STEM$SUF.srt"
 fi
+
+# 语言：zh = 译成中文（默认）；ja = 只写日文字幕（加 --no-translate，跳过翻译服务）
+case "${ASMR_LANG:-zh}" in
+    ja|jp|japanese) LANG_JA=1 ;;
+    *)              LANG_JA=0 ;;
+esac
+MT_FLAG=""
+[ "$LANG_JA" = "1" ] && MT_FLAG="--no-translate"
 
 WAV="$W/_asmr_$$.wav"
 TXT="$W/_asmr_$$.txt"
@@ -142,6 +168,9 @@ SEGDIR="$W/_seg_$$"
 ZIP_TXT="$W/_asmr_$$_zip.txt"
 SV_TXT="$W/_asmr_$$_sv.txt"
 DUMB_LIST="$W/_asmr_$$_dumb.txt"
+# 翻译阶段的「字幕内容实时预览」：native 层每翻一句追加一行
+PREVIEW="$W/_mt_preview"
+SV_PROG="$W/_sv_progress"
 t_start=$(date +%s)
 
 cleanup() {
@@ -149,7 +178,14 @@ cleanup() {
     if [ -n "$WAV" ] && [ "$WAV" != "$IN" ]; then rm -f "$WAV"; fi
     rm -f "$TXT" "$ZIP_TXT" "$SV_TXT" "$DUMB_LIST"
     rm -rf "$SEGDIR"
+    # 进度 / 错误输出也是这一趟的临时文件，一起收掉，
+    # 否则 App 私有目录里会越堆越多（分段音频能到几百 MB）。
+    rm -f "$W/_asr_progress" "$W/_mt_progress" "$W/_sv_progress" "$W/asr.err" "$PREVIEW"
 }
+
+# 无论正常结束、报错退出还是被 SIGTERM（App 点「停止」）都要清干净；
+# 只有 kill -9 才拦不住 —— 那种情况由 App 下次启动时的 cleanWorkFiles() 兜底。
+trap 'cleanup' EXIT INT TERM HUP
 
 # 找模型目录：hy.gguf（翻译模型）必需；识别车道可选 zipformer 和 SenseVoice 两套。
 #   · <dir>/zipformer-ja/{...}  = zipformer 主车道
@@ -192,9 +228,37 @@ if [ -z "$MODEL_DIR" ]; then
     echo "[错误] 请用 App 里的「导入模型」按钮选 asmr-models.zip"
     exit 1
 fi
-if [ "$ZIP_READY" -eq 1 ] && [ "$SV_READY" -eq 1 ] && [ -n "$SV_TOKENS" ]; then
+# 识别模式由 App 的「识别模式」按钮决定（ASMR_ASR）：
+#   fusion（默认）= zipformer 主 + SenseVoice 补漏：覆盖广、更准，速度略慢
+#   zip           = 只用 zipformer：认得更准，安静段/纯音效段可能漏句
+#   sv            = 只用 SenseVoice：快、覆盖广，长难句容易错
+case "${ASMR_ASR:-fusion}" in
+    zip|zipformer) ASR_WANT="zip" ;;
+    sv|sensevoice) ASR_WANT="sv" ;;
+    *)             ASR_WANT="fusion" ;;
+esac
+if [ "$ASR_WANT" = "zip" ] && [ "$ZIP_READY" -ne 1 ]; then
+    echo "[警告] 选了 zipformer 单模，但没装 zipformer-ja/ 那 4 个文件，按可用车道跑"
+    ASR_WANT="auto"
+fi
+if [ "$ASR_WANT" = "sv" ] && { [ "$SV_READY" -ne 1 ] || [ -z "$SV_TOKENS" ]; }; then
+    echo "[警告] 选了 SenseVoice 单模，但没装 model.int8.onnx + tokens.txt，按可用车道跑"
+    ASR_WANT="auto"
+fi
+if [ "$ASR_WANT" = "fusion" ] && { [ "$ZIP_READY" -ne 1 ] || [ "$SV_READY" -ne 1 ] || [ -z "$SV_TOKENS" ]; }; then
+    echo "[提示] 融合模式缺其中一个模型，改按现有机型单车道识别"
+    ASR_WANT="auto"
+fi
+
+if [ "$ASR_WANT" = "zip" ]; then
+    ASR_KIND="zipformer"
+    ASR_NAME="zipformer-ja（精准）"
+elif [ "$ASR_WANT" = "sv" ]; then
+    ASR_KIND="sensevoice"
+    ASR_NAME="SenseVoice（快、覆盖广）"
+elif [ "$ZIP_READY" -eq 1 ] && [ "$SV_READY" -eq 1 ] && [ -n "$SV_TOKENS" ]; then
     ASR_KIND="fused"
-    ASR_NAME="zipformer 主 + SenseVoice 补漏"
+    ASR_NAME="融合：zipformer 主 + SenseVoice 补漏"
 elif [ "$ZIP_READY" -eq 1 ]; then
     ASR_KIND="zipformer"
     [ -n "$ASR_NAME" ] || ASR_NAME="日语 zipformer-ja"
@@ -293,13 +357,35 @@ start_llama() {
     echo "      -> 服务就绪（等了 ${i}s）"
 }
 
+# ★ 翻译服务推迟到「识别全部做完」之后再起（2026-11-11 实测，别改回识别前起）：
+#   llama-server 常驻 RSS ≈ 2.0~2.2 GB（1.1 GB 模型 + 4096 上下文 KV），
+#   而识别阶段 libsherpaoffline.so 自己的峰值就有 0.5~1.4 GB。
+#   两者叠加就把 7.6 GB 顶穿（实测 MemAvailable 归 0、swap 用尽、kswapd0 96%、整机 ANR）。
+#   识别阶段让翻译服务完全不在内存里，是这次最重要的加固。
+ensure_translator() {
+# 仅日文字幕模式：完全不启动翻译服务（省 2 GB 内存，也省掉整段翻译时间）
+if [ "$LANG_JA" = "1" ]; then
+    # 上一轮任务留下的翻译服务如果还驻留着，这里顺手关掉：
+    # 仅日文本来就不需要它，白占 2.2 GB 会让手机边用边紧张（实测反馈过一次整机卡死）
+    OLD=$(llama_pid)
+    if [ -n "$OLD" ]; then
+        kill "$OLD" 2>/dev/null
+        k=0
+        while [ $k -lt 10 ]; do kill -0 "$OLD" 2>/dev/null || break; sleep 1; k=$((k + 1)); done
+        kill -9 "$OLD" 2>/dev/null
+        rm -f "$LLAMA_DIR/_llama.pid"
+        echo "      -> 已释放上一轮驻留的翻译服务（仅日文不需要它）"
+    fi
+    echo "[3/4] 仅日文模式：跳过翻译服务"
+    return 0
+fi
 LP=$(llama_pid)
 if [ -n "$LP" ] && server_alive; then
     if has_metrics; then
-        echo "[2/4] 翻译服务已在运行（复用，省一次模型加载）"
+        echo "[3/4] 翻译服务已在运行（复用，省一次模型加载）"
     elif command -v curl > /dev/null 2>&1; then
         # 老版本起的进程不带 --metrics，App 读不到 tok/s，重启一次
-        echo "[2/4] 旧翻译服务不带 metrics，重启中..."
+        echo "[3/4] 旧翻译服务不带 metrics，重启中..."
         kill $LP 2>/dev/null
         # 必须等旧进程真的退出再启动，否则新进程 bind 18081 失败就静默退出，
         # 而 _llama.pid 会指向这个已经死掉的新进程（实测踩过）。
@@ -313,10 +399,10 @@ if [ -n "$LP" ] && server_alive; then
         sleep 1
         start_llama
     else
-        echo "[2/4] 翻译服务已在运行（无 curl，无法确认 metrics）"
+        echo "[3/4] 翻译服务已在运行（无 curl，无法确认 metrics）"
     fi
 else
-    echo "[2/4] 启动翻译服务（Hy-MT2-1.8B）..."
+    echo "[3/4] 启动翻译服务（Hy-MT2-1.8B，约 2 GB 内存）..."
     start_llama
 fi
 
@@ -326,8 +412,9 @@ if [ -n "$LP" ]; then
 else
     rm -f "$LLAMA_DIR/_llama.pid"
 fi
+}
 
-echo "[3/4] 语音识别（${SEG_SEC} 秒一段 + 前后各 ${LEAD_SEC}s 余量 + ${ASR_NAME}）..."
+echo "[2/4] 语音识别（${SEG_SEC} 秒一段 + 前后各 ${LEAD_SEC}s 余量 + ${ASR_NAME}）..."
 cd "$W" || exit 1
 mkdir -p "$SEGDIR" || {
     echo "[错误] 建不了临时目录 $SEGDIR"
@@ -388,16 +475,20 @@ echo "      -> 切成 $NSEG 段（每段 ${SEG_SEC}s，前后各留 ${LEAD_SEC}s
 # ── 识别车道统一函数：把一批 wav 用指定车道识别，JSON 追加到 $1 ──
 #   $1 = 输出文件；$2 = 车道（zipformer|sensevoice）；$3.. = wav（必须在调用前写好批次标记）
 #   一次把 276 个 wav 全塞进去会被 OOM killer 杀掉（实测日志出现 "Killed"），
-#   所以按 24 段一批，模型每批重载一次（约 1.7s），换来内存平稳。
+#   所以按 $BATCH（默认 6）段一批，模型每批重载一次（约 1.7s），换来内存平稳。
 recognize() {
     local dest="$1" kind="$2"; shift 2
-    local chunk="" k=0 IDX=0
+    local chunk="" k=0 IDX=0 TOTAL=$#
     : > "$dest"
+    # 进度文件：App 靠它显示「识别 x/y 段 + 速度 + 剩余时间」（不写就没有数）
+    echo "0 $TOTAL" > "$W/_asr_progress"
+    # 补车道进度只在融合模式写，开跑先清上一趟的残留，免得 App 误显示
+    rm -f "$SV_PROG"
     while [ $# -gt 0 ]; do
         chunk="$chunk $1"
         shift
         k=$((k + 1))
-        if [ $k -ge 24 ] || [ $# -eq 0 ]; then
+        if [ $k -ge $BATCH ] || [ $# -eq 0 ]; then
             # 段号按"文件个数"累计（不是按 JSON 行数）的批次标记：某个 wav 没语音就
             # 不出 JSON 行，asmr_mobile 得靠这个标记知道"下一条 JSON 属于文件 IDX"，
             # 否则空窗之后的句子段号会错位一格。
@@ -420,6 +511,7 @@ recognize() {
                     $chunk >> "$dest" 2>> "$W/asr.err"
             fi
             IDX=$((IDX + k))
+            echo "$IDX $TOTAL" > "$W/_asr_progress"
             chunk=""
             k=0
         fi
@@ -429,7 +521,7 @@ recognize() {
 # ── 融合：zipformer 全片主车道 + 哑窗/空窗 SenseVoice 补车道 ──
 if [ "$ASR_KIND" = "fused" ]; then
     : > "$W/asr.err"
-    echo "[3/4b] 主车道识别（zipformer 全片）..."
+    echo "[2/4b] 主车道识别（zipformer 全片）..."
     recognize "$ZIP_TXT" zipformer "$SEGDIR"/seg_*.wav
     echo "      -> 主车道 $(grep -c '"text"' "$ZIP_TXT" 2>/dev/null) 段"
     ZSEGS=$(grep -c '"text"' "$ZIP_TXT" 2>/dev/null)
@@ -446,9 +538,16 @@ if [ "$ASR_KIND" = "fused" ]; then
         --scan "$DUMB_LIST" --total-win $NSEG 2>&1 | tail -2
 
     if [ -s "$DUMB_LIST" ]; then
-        echo "      -> 补车道对 $(wc -l < "$DUMB_LIST" | tr -d ' ') 个哑窗/空窗补跑 SenseVoice..."
+        SV_TOTAL=$(wc -l < "$DUMB_LIST" | tr -d ' ')
+        echo "      -> 补车道对 $SV_TOTAL 个哑窗/空窗补跑 SenseVoice..."
         : > "$SV_TXT"
+        # 补车道是一窗一进程，主车道的 _asr_progress 早已写满，
+        # 不另写进度文件的话 App 在补漏那几分钟里数字完全不动（用户反馈）。
+        SV_IDX=0
+        echo "0 $SV_TOTAL" > "$SV_PROG"
         while read -r WN; do
+            SV_IDX=$((SV_IDX + 1))
+            echo "$SV_IDX $SV_TOTAL" > "$SV_PROG"
             case "$WN" in ''|*[!0-9]*) continue ;; esac
             F=$(printf '%s/seg_%04d.wav' "$SEGDIR" $WN)
             [ -f "$F" ] || continue
@@ -462,14 +561,21 @@ if [ "$ASR_KIND" = "fused" ]; then
                 "$F" >> "$SV_TXT" 2>> "$W/asr.err"
         done < "$DUMB_LIST"
         echo "      -> 补车道 $(grep -c '"text"' "$SV_TXT" 2>/dev/null) 段"
+        echo "      -> 识别阶段完成，现在才把翻译服务（约 2 GB）装进内存"
+        ensure_translator
+        rm -f "$W/_mt_progress"; : > "$PREVIEW"
         echo "[4/4] 融合翻译并写字幕（zipformer 保留 + SenseVoice 补漏）..."
-        "$BIN_MT" "$ZIP_TXT" "$OUT" --port $PORT --seg-sec $SEG_SEC --lead $LEAD_SEC \
+        ASMR_PROGRESS="$W/_mt_progress" ASMR_PREVIEW="$PREVIEW" \
+        "$BIN_MT" "$ZIP_TXT" "$OUT" --port $PORT --seg-sec $SEG_SEC --lead $LEAD_SEC $MT_FLAG \
             --backfill "$SV_TXT" --total-win $NSEG 2>&1 | tail -3
     else
         # 无哑窗/空窗：zipformer 结果即最终（省 SenseVoice 全片）
         echo "      -> 无哑窗/空窗，直接采用 zipformer 主车道"
+        ensure_translator
+        rm -f "$W/_mt_progress"; : > "$PREVIEW"
         echo "[4/4] 翻译并写字幕..."
-        "$BIN_MT" "$ZIP_TXT" "$OUT" --port $PORT --seg-sec $SEG_SEC --lead $LEAD_SEC 2>&1 | tail -3
+        ASMR_PROGRESS="$W/_mt_progress" ASMR_PREVIEW="$PREVIEW" \
+        "$BIN_MT" "$ZIP_TXT" "$OUT" --port $PORT --seg-sec $SEG_SEC --lead $LEAD_SEC $MT_FLAG 2>&1 | tail -3
     fi
 else
     # ── 单车道（zipformer 或 SenseVoice）──
@@ -484,8 +590,46 @@ else
         cleanup
         exit 1
     fi
+    ensure_translator
+    rm -f "$W/_mt_progress"; : > "$PREVIEW"
     echo "[4/4] 翻译并写字幕..."
-    "$BIN_MT" "$TXT" "$OUT" --port $PORT --seg-sec $SEG_SEC --lead $LEAD_SEC 2>&1 | tail -3
+    ASMR_PROGRESS="$W/_mt_progress" ASMR_PREVIEW="$PREVIEW" \
+    "$BIN_MT" "$TXT" "$OUT" --port $PORT --seg-sec $SEG_SEC --lead $LEAD_SEC $MT_FLAG 2>&1 | tail -3
+fi
+
+# ── 软字幕：把 srt 当字幕轨封进 mkv ──────────────────────────────
+# -c copy：音视频原样拷贝，不重编码，89 分钟的片子也就几十秒。
+# 这个 ffmpeg 构建没有 mov_text 编码器，mp4 容器装不了字幕轨，所以只能出 mkv。
+SOFT_OUT=""
+if [ "${ASMR_SOFTSUB:-0}" = "1" ] && [ -f "$OUT" ]; then
+    MKV="${OUT%.srt}.mkv"
+    echo "[软字幕] 封装带字幕的文件（不重编码）：${MKV##*/} ..."
+    "$BIN_FFMPEG" -y -hide_banner -loglevel error \
+        -i "$IN" -f srt -i "$OUT" \
+        -map 0:v? -map 0:a? -map 1:s -c copy \
+        -metadata:s:s:0 language=chi "$MKV" || true
+    if [ -f "$MKV" ]; then
+        echo "      -> 已生成：${MKV##*/}（字幕可在播放器里开关）"
+        SOFT_OUT=" + ${MKV##*/}"
+        # 记一笔，App 跑完整个队列后据此询问是否删除源文件
+        echo "$IN|$MKV" >> "$W/_soft_list"
+    else
+        echo "      -> [警告] 软字幕封装失败，外挂字幕仍然可用"
+    fi
+fi
+
+# 输出格式：srt / lrc / both（App 里「输出格式」选，默认两个都要）。
+# native 层两种都写（不想再编一次库），这里按选择把不要的那份删掉。
+if [ -n "$SOFT_OUT" ]; then
+    # 软字幕模式：字幕已经嵌进 mkv，就不再单独留 .srt / .lrc 了（用户明确要求）
+    rm -f "$OUT" "${OUT%.srt}.lrc"
+    DONE_OUT="${MKV##*/}"
+else
+    case "${ASMR_FMT:-both}" in
+        srt) rm -f "${OUT%.srt}.lrc"; DONE_OUT="$OUT" ;;
+        lrc) rm -f "$OUT";          DONE_OUT="${OUT%.srt}.lrc" ;;
+        *)   DONE_OUT="$OUT + ${OUT%.srt}.lrc" ;;
+    esac
 fi
 
 rm -rf "$SEGDIR" "$ZIP_TXT" "$SV_TXT" "$DUMB_LIST"
@@ -497,4 +641,4 @@ rm -rf "$SEGDIR" "$ZIP_TXT" "$SV_TXT" "$DUMB_LIST"
 if [ -n "$WAV" ] && [ "$WAV" != "$IN" ]; then rm -f "$WAV"; fi
 rm -f "$TXT"
 t_end=$(date +%s)
-echo "==== 完成：$OUT + ${OUT%.srt}.lrc（总耗时 $((t_end - t_start)) 秒）===="
+echo "==== 完成：$DONE_OUT（总耗时 $((t_end - t_start)) 秒）===="

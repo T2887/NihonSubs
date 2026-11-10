@@ -632,9 +632,14 @@ fn fmt_lrc_ts(sec: f64) -> String {
     format!("{m:02}:{s:02}.{cs:02}")
 }
 
-/// 从 SRT 输出路径推导 LRC 路径：最后一段后缀换成 .chs.lrc（无 .chs 时 .lrc）。
+/// 从 SRT 输出路径推导 LRC 路径：语言后缀跟着 SRT 走。
+///   xxx.chs.srt -> xxx.chs.lrc（中文）
+///   xxx.ja.srt  -> xxx.ja.lrc （仅日文）
+///   xxx.srt     -> xxx.chs.lrc（老版本默认中文）
 fn lrc_out_path(srt_path: &str) -> String {
-    if let Some(stem) = srt_path.strip_suffix(".chs.srt") {
+    if let Some(stem) = srt_path.strip_suffix(".ja.srt") {
+        format!("{stem}.ja.lrc")
+    } else if let Some(stem) = srt_path.strip_suffix(".chs.srt") {
         format!("{stem}.chs.lrc")
     } else if let Some(stem) = srt_path.strip_suffix(".srt") {
         format!("{stem}.chs.lrc")
@@ -905,6 +910,16 @@ fn main() {
     let mut srt = String::new();
     let mut lrc = String::new();
     let mut failed = 0usize;
+    // App 侧「共 N 段 / 第 k 段」与进度条靠这个文件：每处理完一段覆盖写一次
+    // 格式："<已处理> <总数>"。没设环境变量就不写（命令行手跑时无副作用）。
+    let prog_path = std::env::var("ASMR_PROGRESS").ok();
+    // App 侧「字幕内容实时预览」：每翻完一句就往这个文件追加一行，
+    // 格式 "<start>\t<end>\t<原文>\t<译文>"。最终 srt/lrc 仍在循环结束后一次落盘，
+    // 所以这个文件是翻译阶段唯一能让 App 看到内容的东西。
+    let mut prev_file = std::env::var("ASMR_PREVIEW")
+        .ok()
+        .and_then(|p| fs::OpenOptions::new().create(true).append(true).open(p).ok());
+    let total = segs.len();
     for (n, s) in segs.iter().enumerate() {
         let zh = if do_translate {
             match translate_retry(port, &s.text) {
@@ -921,6 +936,19 @@ fn main() {
         };
         if n < 200 || n % 20 == 0 {
             eprintln!("[{:>7.2}s -> {:>7.2}s] {}", s.start, s.end, zh);
+        }
+        if let Some(p) = &prog_path {
+            let _ = fs::write(p, format!("{} {}\n", n + 1, total));
+        }
+        if let Some(f) = prev_file.as_mut() {
+            let _ = writeln!(
+                f,
+                "{:.2}\t{:.2}\t{}\t{}",
+                s.start,
+                s.end,
+                s.text.replace('\t', " "),
+                zh.replace('\t', " ")
+            );
         }
         srt.push_str(&format!(
             "{}\n{} --> {}\n{}\n\n",

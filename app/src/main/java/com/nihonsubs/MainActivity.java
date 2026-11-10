@@ -110,6 +110,10 @@ public class MainActivity extends Activity {
     private String remoteModelUrl = null;
     /** 网盘提取码（latest.txt 里的 MODEL_CODE，可空） */
     private String remoteModelCode = null;
+    /** 当前显示的模型弹窗；重复触发时先关掉旧的，避免叠出两个一样的弹窗。 */
+    private android.app.AlertDialog modelDialog = null;
+    /** 正在导入模型（解压/拷贝）时不再弹下载引导。 */
+    private volatile boolean importingModels = false;
     private int curIdx = 0;
     private float fileProgress = 0f;
     private volatile boolean stopping = false;
@@ -702,7 +706,14 @@ public class MainActivity extends Activity {
                 return;
             }
             final Uri mUri = data.getData();
-            new Thread(() -> copyModel(mUri), "model-import").start();
+            importingModels = true;
+            new Thread(() -> {
+                try {
+                    copyModel(mUri);
+                } finally {
+                    importingModels = false;
+                }
+            }, "model-import").start();
             return;
         }
         if (req != REQ_PICK || res != RESULT_OK || data == null) return;
@@ -936,6 +947,7 @@ public class MainActivity extends Activity {
 
     // ── 模型导入（SAF 文件选择器）────────────────────────
     private void startModelImport() {
+        dismissModelDialog();
         appendLog("[模型] 请选择 asmr-models.zip（推荐，一次装齐）；也可单独选 model.int8.onnx 或 hy.gguf");
         pickModelFile();
     }
@@ -1018,6 +1030,7 @@ public class MainActivity extends Activity {
         }
         final int n = got;
         ui.post(() -> {
+            dismissModelDialog();   // 导完就把引导弹窗收掉，不让它挂在屏幕上
             boolean ok = new File(md, "model.int8.onnx").isFile() && new File(md, "hy.gguf").isFile();
             if (ok) {
                 appendLog("[模型] 模型包导入完成（" + n + " 个文件），点「开始处理」即可");
@@ -1103,6 +1116,7 @@ public class MainActivity extends Activity {
         ui.post(this::refreshModelRow);
         final File md2 = modelDir();
         ui.post(() -> {
+            dismissModelDialog();
             boolean onnx = new File(md2, "model.int8.onnx").isFile();
             boolean gguf = new File(md2, "hy.gguf").isFile();
             if (onnx && gguf) {
@@ -1629,6 +1643,8 @@ public class MainActivity extends Activity {
 
     /** 「缺模型」引导：弹窗让用户去下载页取 asmr-models.zip（地址来自 latest.txt 的 MODEL_URL）。 */
     private void promptModelDownload() {
+        if (importingModels) { toast("正在导入模型，请稍等"); return; }
+        dismissModelDialog();
         // 模型已在位：这个按钮改成「重新导入」入口，而不是只弹下载页
         File md0 = modelDir();
         if (new File(md0, "model.int8.onnx").isFile() && new File(md0, "hy.gguf").isFile()) {
@@ -1697,7 +1713,21 @@ public class MainActivity extends Activity {
         });
         b.setNeutralButton("已下载，去导入", (d, w) -> { d.dismiss(); startModelImport(); });
         b.setNegativeButton("取消", (d, w) -> d.dismiss());
-        try { b.show(); } catch (Exception ignored) { }
+        dismissModelDialog();
+        try {
+            modelDialog = b.create();
+            modelDialog.setOnDismissListener(d -> modelDialog = null);
+            modelDialog.show();
+        } catch (Exception ignored) { }
+    }
+
+    /** 关掉当前显示着的模型弹窗（不会影响其它弹窗）。 */
+    private void dismissModelDialog() {
+        final android.app.AlertDialog d = modelDialog;
+        modelDialog = null;
+        if (d != null) {
+            try { d.dismiss(); } catch (Exception ignored) { }
+        }
     }
 
     /** 模型已在位时的入口：重新导入 / 打开下载页。 */
@@ -1717,7 +1747,12 @@ public class MainActivity extends Activity {
             });
         }
         b.setNegativeButton("关闭", (d, w) -> d.dismiss());
-        try { b.show(); } catch (Exception ignored) { }
+        dismissModelDialog();
+        try {
+            modelDialog = b.create();
+            modelDialog.setOnDismissListener(d -> modelDialog = null);
+            modelDialog.show();
+        } catch (Exception ignored) { }
     }
 
     private void openUrl(String url) {

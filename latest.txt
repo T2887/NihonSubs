@@ -2,8 +2,8 @@
 # 格式：VERSION=<语义版本号> APK=<下载地址> NOTE=<更新说明（可空）>
 # MODEL_URL=<模型包下载页；缺模型时 App 弹窗「去下载」打开它。换网盘只改这一行，不必重打包>
 # MODEL_CODE=<网盘提取码（可空）；有值时弹窗会显示并复制到剪贴板>
-VERSION=1.1.7
-APK=https://github.com/T2887/NihonSubs/releases/download/v1.1.7/NihonSubs-v1.1.7.apk
+VERSION=1.1.8
+APK=https://github.com/T2887/NihonSubs/releases/download/v1.1.8/NihonSubs-v1.1.8.apk
 MODEL_URL=https://pan.quark.cn/s/42530f352af0
 MODEL_CODE=GHXq
-NOTE=v1.1.7：模型改存 App 私有目录（不再放 /sdcard），避免 mmap 加载 1.1 GB 模型时把整机拖到 ANR；老用户首次启动自动搬迁一次，搬完删除旧文件。修复导入后队列/模型状态偶发不同步。备用百度网盘 https://pan.baidu.com/s/1UrvC4AaxsV-BBJWOrTNUdg?pwd=c82t 提取码 c82t。
+NOTE=v1.1.8：新增「软字幕（mkv）」——字幕直接嵌进视频，播放器里能开关字幕，开启后不再单独留 .srt/.lrc，跑完会问要不要删掉原文件；修复字幕文件名与视频不一致（个别文件名带 @ 时播放器不加载字幕）；使用说明新增【别被杀掉】，按小米/华为/OPPO/vivo/三星/原生安卓给出省电与后台设置建议；修复新一轮任务进度条停在 100%、识别阶段运行状态显示成翻译模型 0.0 t/s 的问题。备用百度网盘 https://pan.baidu.com/s/1UrvC4AaxsV-BBJWOrTNUdg?pwd=c82t 提取码 c82t。（不再放 /sdcard），避免 mmap 加载 1.1 GB 模型时把整机拖到 ANR；老用户首次启动自动搬迁一次，搬完删除旧文件。修复导入后队列/模型状态偶发不同步。备用百度网盘 https://pan.baidu.com/s/1UrvC4AaxsV-BBJWOrTNUdg?pwd=c82t 提取码 c82t。

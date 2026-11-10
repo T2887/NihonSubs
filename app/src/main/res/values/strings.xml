@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">日文字幕生成器</string>
+    <string name="app_subtitle">本地离线 · 日音中字 · 手机 CPU 推理</string>
+
+    <string name="env_title">环境</string>
+    <string name="files_title">文件列表</string>
+    <string name="progress_title">进度</string>
+    <string name="log_title">运行日志</string>
+
+    <string name="label_work_dir">工作目录</string>
+    <string name="label_out_dir">输出目录</string>
+    <string name="out_dir_auto">跟随视频所在目录（自动）</string>
+    <string name="label_device">设备状态</string>
+    <string name="device_cpu">CPU 推理（arm64，8 核）</string>
+
+    <string name="empty_files">（列表为空，点下面的按钮添加视频或音频）</string>
+    <string name="btn_add">添加文件</string>
+    <string name="btn_clear">清空列表</string>
+    <string name="btn_start">开始处理</string>
+    <string name="btn_stop">停止</string>
+
+    <string name="stage_idle">当前阶段　—</string>
+    <string name="stage_prepare">当前阶段　准备中</string>
+    <string name="stage_extract">当前阶段　提取音频</string>
+    <string name="stage_asr">当前阶段　语音识别</string>
+    <string name="stage_asr_running">当前阶段　语音识别（进行中）</string>
+    <string name="stage_translate">当前阶段　翻译</string>
+    <string name="stage_done">当前阶段　完成</string>
+    <string name="stage_stopped">当前阶段　已停止</string>
+    <string name="stage_wait_model">当前阶段　等待模型</string>
+    <string name="action_idle">当前动作　—</string>
+    <string name="action_prefix">当前动作　</string>
+
+    <string name="log_ready">就绪。点「添加文件」选好视频，再点下方「开始处理」。</string>
+    <string name="msg_pick_first">[提示] 先添加要处理的视频或音频</string>
+    <string name="msg_preparing">[准备] 首次启动，正在解压运行文件…</string>
+    <string name="msg_prepared">[准备] 解压完成</string>
+    <string name="msg_need_model">[缺少模型] 首次使用需要把两个模型文件放到：\n            %1$s\n            model.int8.onnx（约 230 MB）、hy.gguf（约 1.1 GB）\n[缺少模型] 可用数据线从电脑拷进这个目录，再点一次开始</string>
+    <string name="msg_extract_failed">[错误] ffmpeg 提取失败</string>
+    <string name="msg_no_speech">[错误] 没识别出任何语音</string>
+    <string name="msg_stopped_request">[停止] 已请求结束当前进程</string>
+</resources>

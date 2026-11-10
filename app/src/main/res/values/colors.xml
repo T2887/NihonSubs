@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 配色照 PC 版（Rust/egui 界面）的色板，与桌面端保持一致的观感 -->
+<resources>
+    <color name="bg">#FFF0EEE6</color>
+    <color name="card">#FFFDFCF8</color>
+    <color name="card_line">#FFE3DDD0</color>
+    <color name="sunk">#FFF5F2EA</color>
+    <color name="ink">#FF1F1E1D</color>
+    <color name="ink2">#FF453E35</color>
+    <color name="ink3">#FF6B6458</color>
+    <color name="accent">#FFC96442</color>
+    <color name="accent_deep">#FFB4532F</color>
+    <color name="accent_soft">#FFF7EBE4</color>
+    <color name="accent_ink">#FF7D3F26</color>
+    <color name="ok_green">#FF5F8A63</color>
+    <color name="warn">#FFA4442C</color>
+</resources>

@@ -1,0 +1,43 @@
+# 构建产物
+build/
+*.apk
+*.idsig
+target/
+
+# 签名密钥——绝不能提交（泄露=任何人都能伪造你的升级包）
+*.keystore
+KEYSTORE.txt
+*.jks
+
+# 模型与大数据（数 GB，本仓库不含，需按 README 下载）
+*.onnx
+*.gguf
+*.wav
+*.mp4
+*.tar.bz2
+*.zip
+
+# 运行时产物
+_asmr_*
+asr.err
+*.bak
+
+# 一次性补丁脚本与截图（开发期遗留，非源码）
+_tools/
+_shots/
+downloads/
+
+# 开发环境交叉编译工具链与第三方源码树（各自独立开源）
+native/sherpa-src/
+native/llama_src/
+native/ort/
+native/ffmpeg-7.1/
+native/whisper-src/
+native/whisper-build/
+native/sherpa-build/
+native/sherpa-push/
+# 可执行二进制（编译产物的 .so）——开源版不含，需按 README 自行构建/放置
+app/src/main/jniLibs/
+# 中小模型文件（silero VAD / token 表），随 APK 或手动放置
+app/src/main/assets/silero_vad.onnx
+app/src/main/assets/tokens.txt

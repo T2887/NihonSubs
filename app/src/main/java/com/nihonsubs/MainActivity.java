@@ -106,6 +106,8 @@ public class MainActivity extends Activity {
     private int notifiedPct = -1;
     private static final int REQ_MODEL = 1002;
     private String pendingModelName = null;
+    /** 线上模型包下载地址（latest.txt 里的 MODEL_URL，换网盘只改这个文件即可） */
+    private String remoteModelUrl = null;
     private int curIdx = 0;
     private float fileProgress = 0f;
     private volatile boolean stopping = false;
@@ -636,7 +638,7 @@ public class MainActivity extends Activity {
         row.addView(modelStateView, slp);
 
         modelBtn = pill("导入模型", true, 34);
-        modelBtn.setOnClickListener(v -> startModelImport());
+        modelBtn.setOnClickListener(v -> promptModelDownload());
         row.addView(modelBtn);
 
         // 建完 UI 之后刷新一次（此时 modelDir 已可读）
@@ -903,7 +905,7 @@ public class MainActivity extends Activity {
             appendLog("            也可以依次单独选 model.int8.onnx（约 230 MB）和 hy.gguf（约 1.1 GB）。");
             appendLog("[缺少模型] 目标目录：" + md.getAbsolutePath());
             setStage("当前阶段　等待模型");
-            startModelImport();
+            promptModelDownload();
             return;
         }
         busy = true;
@@ -954,7 +956,7 @@ public class MainActivity extends Activity {
         return uri.getLastPathSegment();
     }
 
-    /** 解压 asmr-models.zip：只取 model.int8.onnx 和 hy.gguf，其余条目跳过。 */
+    /** 解压 asmr-models.zip：取 model.int8.onnx、hy.gguf 与 zipformer-ja/ 的 4 个文件（短名）。 */
     private void unzipModels(final Uri uri) {
         final File md = modelDir();
         appendLog("[模型] 正在解压模型包 …");
@@ -967,11 +969,24 @@ public class MainActivity extends Activity {
             byte[] buf = new byte[1 << 20];
             while ((e = zin.getNextEntry()) != null) {
                 if (e.isDirectory()) continue;
-                String base = new File(e.getName()).getName();
-                boolean want = "model.int8.onnx".equals(base) || "hy.gguf".equals(base);
-                if (!want) continue;
-                File dst = new File(md, base);
-                appendLog("[模型] 解压 " + base + " …");
+                String name = e.getName().replace('\\', '/');
+                String base = new File(name).getName();
+                boolean core = "model.int8.onnx".equals(base) || "hy.gguf".equals(base);
+                boolean zipf = "zipformer-ja/encoder.int8.onnx".equals(name)
+                        || "zipformer-ja/decoder.onnx".equals(name)
+                        || "zipformer-ja/joiner.onnx".equals(name)
+                        || "zipformer-ja/tokens.txt".equals(name);
+                if (!core && !zipf) continue;
+                File dst;
+                if (core) {
+                    dst = new File(md, base);
+                } else {
+                    File zdir = new File(md, "zipformer-ja");
+                    if (!zdir.isDirectory() && !zdir.mkdirs() && !zdir.isDirectory())
+                        throw new java.io.IOException("无法创建 zipformer-ja 目录");
+                    dst = new File(zdir, base);
+                }
+                appendLog("[模型] 解压 " + (zipf ? "zipformer-ja/" : "") + base + " …");
                 long total = 0, last = 0;
                 try (OutputStream out = new FileOutputStream(dst)) {
                     int n;
@@ -1511,6 +1526,7 @@ public class MainActivity extends Activity {
             if (line.regionMatches(true, 0, "VERSION=", 0, 8)) remoteVer = line.substring(8).trim();
             else if (line.regionMatches(true, 0, "APK=", 0, 4)) apkUrl = line.substring(4).trim();
             else if (line.regionMatches(true, 0, "NOTE=", 0, 5)) note = line.substring(5).trim();
+            else if (line.regionMatches(true, 0, "MODEL_URL=", 0, 10)) remoteModelUrl = line.substring(10).trim();
             else if (remoteVer == null && !line.contains("=")) remoteVer = line; // 裸版本号
             else if (apkUrl == null && (line.startsWith("http"))) apkUrl = line;
         }
@@ -1566,6 +1582,53 @@ public class MainActivity extends Activity {
     }
     private static long parseLong(String s) {
         try { return Long.parseLong(s); } catch (Exception e) { return 0; }
+    }
+
+    /** 「缺模型」引导：弹窗让用户去下载页取 asmr-models.zip（地址来自 latest.txt 的 MODEL_URL）。 */
+    private void promptModelDownload() {
+        if (remoteModelUrl != null && !remoteModelUrl.isEmpty()) {
+            showModelDlDialog(remoteModelUrl);
+            return;
+        }
+        Thread t = new Thread(() -> {
+            String url = null;
+            for (String base : new String[]{VERSION_URL, VERSION_URL_BACKUP}) {
+                try {
+                    String raw = httpGetLong(base);
+                    if (raw == null) continue;
+                    for (String line : raw.split("\n")) {
+                        line = line.trim();
+                        if (line.regionMatches(true, 0, "MODEL_URL=", 0, 10)) {
+                            url = line.substring(10).trim();
+                            break;
+                        }
+                    }
+                    if (url != null && !url.isEmpty()) break;
+                } catch (Exception ignored) { }
+            }
+            final String u = url;
+            ui.post(() -> {
+                if (u != null && !u.isEmpty()) {
+                    remoteModelUrl = u;
+                    showModelDlDialog(u);
+                } else {
+                    startModelImport();   // 取不到线上地址就退回本地导入
+                }
+            });
+        }, "model-url");
+        t.setDaemon(true);
+        t.start();
+    }
+
+    private void showModelDlDialog(final String url) {
+        android.app.AlertDialog.Builder b = new android.app.AlertDialog.Builder(this);
+        b.setTitle("需要先下载模型");
+        b.setMessage("首次使用需要模型包 asmr-models.zip（约 1.5 GB）。\n\n"
+                + "点「去下载」用浏览器打开下载页；下载好后回到 App 选这个 zip，会自动解压安装。");
+        b.setPositiveButton("去下载", (d, w) -> { d.dismiss(); openUrl(url); });
+        b.setNeutralButton("已下载，去导入", (d, w) -> { d.dismiss(); startModelImport(); });
+        b.setNegativeButton("取消", (d, w) -> d.dismiss());
+        try { b.show(); } catch (Exception ignored) { }
     }
 
     private void openUrl(String url) {

@@ -5,6 +5,7 @@ import android.animation.AnimatorListenerAdapter;
 import android.animation.ValueAnimator;
 import android.app.Activity;
 import android.content.Intent;
+import android.content.pm.PackageManager;
 import android.database.Cursor;
 import android.graphics.Color;
 import android.graphics.Typeface;
@@ -12,14 +13,18 @@ import android.graphics.drawable.GradientDrawable;
 import android.graphics.drawable.RippleDrawable;
 import android.content.res.ColorStateList;
 import android.net.Uri;
+import android.os.Environment;
 import android.os.Bundle;
 import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
+import android.provider.DocumentsContract;
+import android.provider.MediaStore;
 import android.provider.OpenableColumns;
 import android.util.Log;
 import android.util.TypedValue;
 import android.view.Gravity;
+import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.Window;
@@ -39,6 +44,9 @@ import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.Set;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipInputStream;
 import java.util.List;
@@ -117,7 +125,20 @@ public class MainActivity extends Activity {
     private int curIdx = 0;
     private float fileProgress = 0f;
     private volatile boolean stopping = false;
-    private final java.util.List<String> fileState = new java.util.ArrayList<>();
+    /** 每个队列文件的状态，按路径索引：队列里删条目也不会错位。 */
+    private final Map<String, String> fileState =
+            new java.util.concurrent.ConcurrentHashMap<>();
+    /** 正在处理的那个文件的路径（队列界面高亮用）。 */
+    private volatile String curFile = null;
+    // ── 二级界面：队列 ──
+    private FrameLayout queueOverlay;
+    private LinearLayout queueList;
+    private ScrollView queueScroll;
+    private TextView queueSub;
+    private final Set<String> queueSel = new java.util.LinkedHashSet<>();
+    private boolean rowSwiping = false;
+    private boolean askedAllFiles = false;
+    private float edgeDownX = 0f, edgeDownY = 0f;
     private String notifiedStage = "";       // 0..1
     private ValueAnimator progressAnim;
 
@@ -149,6 +170,10 @@ public class MainActivity extends Activity {
 
     /** 卡片标题：左侧竖条 + 标题文字（照 PC 版 card_badge）。 */
     private void cardTitle(LinearLayout card, String title) {
+        cardTitle(card, title, null, null);
+    }
+
+    private void cardTitle(LinearLayout card, String title, String action, Runnable onClick) {
         LinearLayout row = new LinearLayout(this);
         row.setOrientation(LinearLayout.HORIZONTAL);
         row.setGravity(Gravity.CENTER_VERTICAL);
@@ -165,6 +190,13 @@ public class MainActivity extends Activity {
         t.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 15f);
         t.setTypeface(Typeface.DEFAULT_BOLD);
         row.addView(t);
+        if (action != null) {
+            row.addView(new View(this), new LinearLayout.LayoutParams(
+                    0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+            TextView ab = narrowPill(action);
+            ab.setOnClickListener(v -> onClick.run());
+            row.addView(ab);
+        }
 
         LinearLayout.LayoutParams rlp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
@@ -243,6 +275,7 @@ public class MainActivity extends Activity {
         scanInputDir();
         // 启动后自动检查一次更新（静默，仅在有新版本时提示）
         ui.postDelayed(() -> checkForUpdate(false), 2000);
+        ui.postDelayed(this::ensureAllFilesAccess, 1200);
     }
 
     /** 启动时扫一遍 input 目录：从电脑拷进来的文件不用再手动选。 */
@@ -332,7 +365,8 @@ public class MainActivity extends Activity {
         LinearLayout env = (LinearLayout) card();
         cardTitle(env, "环境");
         env.addView(infoRow("工作目录", appDir().getAbsolutePath()));
-        env.addView(infoRow("输出目录", outputDir().getAbsolutePath()));
+        env.addView(infoRow("输出目录",
+                hasAllFiles() ? "与原片同一文件夹" : "原片旁（未授权时放 App 的 output）"));
         env.addView(statusRow());
         env.addView(modelRow());
         {
@@ -361,7 +395,7 @@ public class MainActivity extends Activity {
 
         // ── 卡片 2：文件列表 ──
         LinearLayout files = (LinearLayout) card();
-        cardTitle(files, "文件列表");
+        cardTitle(files, "文件列表", "队列", this::openQueue);
         fileBox = new LinearLayout(this);
         fileBox.setOrientation(LinearLayout.VERTICAL);
         fileBox.setBackground(round(SUNK, 10, CARD_LINE, 1));
@@ -512,7 +546,419 @@ public class MainActivity extends Activity {
         blp.gravity = Gravity.BOTTOM;
         root.addView(bar, blp);
 
+        // ── 二级界面：队列浮层（默认藏起来，从左往右划打开）──
+        queueOverlay = buildQueueOverlay();
+        queueOverlay.setVisibility(View.GONE);
+        root.addView(queueOverlay, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+
         return root;
+    }
+
+    // ── 二级界面：队列（从左往右划打开）──────────────────────
+    /** 屏幕左侧往右划 → 打开队列页。用 dispatchTouchEvent 抓，避免和列表点击打架。 */
+    @Override
+    public boolean dispatchTouchEvent(MotionEvent ev) {
+        if (queueOverlay == null || queueOverlay.getVisibility() == View.VISIBLE) {
+            return super.dispatchTouchEvent(ev);
+        }
+        switch (ev.getActionMasked()) {
+            case MotionEvent.ACTION_DOWN:
+                edgeDownX = ev.getX();
+                edgeDownY = ev.getY();
+                break;
+            case MotionEvent.ACTION_UP: {
+                float dx = ev.getX() - edgeDownX;
+                float dy = ev.getY() - edgeDownY;
+                // 系统返回手势会吃掉左边缘的右划，所以不限定起手位置，只要横向右划够长就开
+                if (dx > dp(110) && Math.abs(dy) < dx * 0.7f) {
+                    openQueue();
+                }
+                break;
+            }
+            default:
+                break;
+        }
+        return super.dispatchTouchEvent(ev);
+    }
+
+    @Override
+    public void onBackPressed() {
+        if (queueOverlay != null && queueOverlay.getVisibility() == View.VISIBLE) {
+            closeQueue();
+            return;
+        }
+        super.onBackPressed();
+    }
+
+    private void openQueue() {
+        if (queueOverlay == null) return;
+        queueSel.clear();
+        refreshQueue();
+        queueOverlay.animate().cancel();
+        // 和手势同向：从左边缘往右划 → 队列页从左边滑进来
+        queueOverlay.setTranslationX(-getResources().getDisplayMetrics().widthPixels);
+        queueOverlay.setVisibility(View.VISIBLE);
+        queueOverlay.animate().translationX(0f).setDuration(220)
+                .setInterpolator(new DecelerateInterpolator()).start();
+        ui.removeCallbacks(queueTick);
+        ui.postDelayed(queueTick, 500L);
+    }
+
+    private void closeQueue() {
+        if (queueOverlay == null || queueOverlay.getVisibility() != View.VISIBLE) return;
+        ui.removeCallbacks(queueTick);
+        queueOverlay.animate().cancel();
+        queueOverlay.animate().translationX(-getResources().getDisplayMetrics().widthPixels)
+                .setDuration(180L)
+                .setListener(new AnimatorListenerAdapter() {
+                    @Override
+                    public void onAnimationEnd(Animator a) {
+                        if (queueOverlay != null) {
+                            queueOverlay.setVisibility(View.GONE);
+                            queueOverlay.animate().setListener(null);
+                        }
+                    }
+                }).start();
+    }
+
+    /** 队列页开着时定期刷新（处理中每行状态会变）。 */
+    private final Runnable queueTick = new Runnable() {
+        @Override
+        public void run() {
+            if (queueOverlay == null || queueOverlay.getVisibility() != View.VISIBLE) return;
+            // 手势进行中或刚松手时别重建行（会打断滑动）
+            if (!rowSwiping && System.currentTimeMillis() - queueTouchAt > 800L) refreshQueueIfChanged();
+            ui.postDelayed(this, 900L);
+        }
+    };
+
+    private FrameLayout buildQueueOverlay() {
+        FrameLayout overlay = new FrameLayout(this);
+        overlay.setBackgroundColor(BG);
+        overlay.setClickable(true);
+        overlay.setElevation(dp(12));
+
+        LinearLayout col = new LinearLayout(this);
+        col.setOrientation(LinearLayout.VERTICAL);
+        col.setPadding((int) dp(14), (int) dp(20), (int) dp(14), (int) dp(12));
+
+        LinearLayout head = new LinearLayout(this);
+        head.setOrientation(LinearLayout.HORIZONTAL);
+        head.setGravity(Gravity.CENTER_VERTICAL);
+        TextView title = label("队列", INK, 20f);
+        title.setTypeface(Typeface.DEFAULT_BOLD);
+        head.addView(title);
+        queueSub = label("", INK3, 11.5f);
+        LinearLayout.LayoutParams qslp = new LinearLayout.LayoutParams(
+                0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
+        qslp.leftMargin = (int) dp(10);
+        head.addView(queueSub, qslp);
+        TextView close = narrowPill("关闭");
+        close.setOnClickListener(v -> closeQueue());
+        head.addView(close);
+        col.addView(head);
+
+        TextView tip = label("上下滑动看全部 · 长按任务选中 · 选中后往左划移除", INK3, 11f);
+        LinearLayout.LayoutParams tipLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        tipLp.topMargin = (int) dp(8);
+        tipLp.bottomMargin = (int) dp(10);
+        col.addView(tip, tipLp);
+
+        queueScroll = new ScrollView(this);
+        queueScroll.setBackground(round(SUNK, 12, CARD_LINE, 1));
+        queueList = new LinearLayout(this);
+        queueList.setOrientation(LinearLayout.VERTICAL);
+        queueList.setPadding((int) dp(10), (int) dp(10), (int) dp(10), (int) dp(10));
+        queueScroll.addView(queueList, new ScrollView.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        col.addView(queueScroll, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
+
+        LinearLayout foot = new LinearLayout(this);
+        foot.setOrientation(LinearLayout.HORIZONTAL);
+        LinearLayout.LayoutParams flp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        flp.topMargin = (int) dp(10);
+        TextView rmSel = narrowPill("移除选中");
+        rmSel.setOnClickListener(v -> {
+            if (queueSel.isEmpty()) {
+                toast("先长按选中要移除的任务");
+                return;
+            }
+            int n = 0;
+            for (String p : new ArrayList<>(queueSel)) {
+                if (removeFromQueue(p, false)) n++;
+            }
+            queueSel.clear();
+            refreshQueue();
+            refreshFiles();
+            if (n > 0) appendLog("已从队列移除 " + n + " 个");
+        });
+        foot.addView(rmSel, third());
+        TextView startNow = narrowPill("开始处理");
+        startNow.setOnClickListener(v -> {
+            closeQueue();
+            ui.postDelayed(this::start, 240L);
+        });
+        foot.addView(startNow, third());
+        TextView stopNow = narrowPill("停止");
+        stopNow.setOnClickListener(v -> stop());
+        foot.addView(stopNow, third());
+        col.addView(foot, flp);
+
+        overlay.addView(col, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        return overlay;
+    }
+
+    /** 重建队列列表：全部任务 + 各自状态；长按多选、选中后往左划移除。 */
+    private void refreshQueue() {
+        if (queueList == null) return;
+        queueList.removeAllViews();
+        int total = picked.size();
+        int done = 0;
+        for (String p : picked) if ("完成".equals(stateOf(p))) done++;
+        if (queueSub != null) {
+            queueSub.setText("共 " + total + " 个 · 完成 " + done
+                    + (queueSel.isEmpty() ? "" : " · 已选 " + queueSel.size()));
+        }
+        if (total == 0) {
+            queueList.addView(label("队列是空的，回主界面点「添加文件」", INK3, 12.5f));
+            queueSig = queueSignature();
+            return;
+        }
+        for (int k = 0; k < total; k++) {
+            final String path = picked.get(k);
+            final String st = stateOf(path);
+            final boolean cur = busy && path.equals(curFile);
+            final boolean sel = queueSel.contains(path);
+
+            final LinearLayout row = new LinearLayout(this);
+            row.setOrientation(LinearLayout.VERTICAL);
+            row.setPadding((int) dp(12), (int) dp(10), (int) dp(12), (int) dp(10));
+            row.setBackground(round(sel ? ACCENT_SOFT : CARD, 10,
+                    sel ? ACCENT : CARD_LINE, sel ? 1.5f : 1f));
+            LinearLayout.LayoutParams rlp = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            rlp.bottomMargin = (int) dp(8);
+            row.setLayoutParams(rlp);
+
+            LinearLayout top = new LinearLayout(this);
+            top.setOrientation(LinearLayout.HORIZONTAL);
+            top.setGravity(Gravity.CENTER_VERTICAL);
+            top.addView(label((k + 1) + ".", ACCENT, 12f), new LinearLayout.LayoutParams(
+                    (int) dp(24), ViewGroup.LayoutParams.WRAP_CONTENT));
+            TextView name = label(new File(path).getName(), INK, 13.5f);
+            name.setSingleLine(true);
+            name.setEllipsize(android.text.TextUtils.TruncateAt.MIDDLE);
+            name.setTypeface(Typeface.DEFAULT_BOLD);
+            top.addView(name, new LinearLayout.LayoutParams(0,
+                    ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+            LinearLayout.LayoutParams stlp = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            stlp.leftMargin = (int) dp(6);
+            top.addView(label(percentText(st, cur), stateColor(st, cur), 11.5f), stlp);
+            row.addView(top);
+
+            if (cur) {
+                FrameLayout track = new FrameLayout(this);
+                track.setBackground(round(0xFFE9E3D6, 4, 0, 0));
+                LinearLayout.LayoutParams tlp = new LinearLayout.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT, (int) dp(5));
+                tlp.topMargin = (int) dp(8);
+                row.addView(track, tlp);
+                View fill = new View(this);
+                fill.setBackground(round(ACCENT, 4, 0, 0));
+                float f = Math.max(0.02f, Math.min(1f, fileProgress));
+                int w = (int) (getResources().getDisplayMetrics().widthPixels * f * 0.82f);
+                track.addView(fill, new FrameLayout.LayoutParams(w,
+                        ViewGroup.LayoutParams.MATCH_PARENT));
+            }
+
+            // 选中只改这一行的样式，不重建整个列表（重建会把手势流打断，滑动就失效了）
+            row.setOnClickListener(v -> toggleQueueSel(path, row));
+            row.setOnLongClickListener(v -> {
+                if (rowSwiping) return true;
+                toggleQueueSel(path, row);
+                return true;
+            });
+            final View rv = row;
+            row.setOnTouchListener((v, e) -> {
+                switch (e.getActionMasked()) {
+                    case MotionEvent.ACTION_DOWN:
+                        swipeStartX = e.getRawX();
+                        rowSwiping = false;
+                        queueTouchAt = System.currentTimeMillis();
+                        return false;
+                    case MotionEvent.ACTION_MOVE: {
+                        if (!queueSel.contains(path)) return false;
+                        float dx = e.getRawX() - swipeStartX;
+                        if (dx < -dp(10)) {
+                            rowSwiping = true;
+                            rv.setTranslationX(dx);
+                        }
+                        return false;
+                    }
+                    case MotionEvent.ACTION_UP:
+                    case MotionEvent.ACTION_CANCEL: {
+                        float dx = e.getRawX() - swipeStartX;
+                        if (rowSwiping && dx < -dp(72)) {
+                            flingRemove(path, rv);
+                        } else if (rowSwiping) {
+                            rv.animate().translationX(0f).setDuration(140L).start();
+                        }
+                        rowSwiping = false;
+                        queueTouchAt = System.currentTimeMillis();
+                        return false;
+                    }
+                    default:
+                        return false;
+                }
+            });
+            queueList.addView(row);
+        }
+        queueSig = queueSignature();
+    }
+
+    /** 切换某一行选中状态：只改这一行外观 + 顶部统计，不重建列表。 */
+    private void toggleQueueSel(String path, View row) {
+        if (queueSel.contains(path)) queueSel.remove(path);
+        else queueSel.add(path);
+        boolean on = queueSel.contains(path);
+        row.setBackground(round(on ? ACCENT_SOFT : CARD, 10,
+                on ? ACCENT : CARD_LINE, on ? 1.5f : 1f));
+        row.setPadding((int) dp(12), (int) dp(10), (int) dp(12), (int) dp(10));
+        updateQueueSub();
+    }
+
+    private void updateQueueSub() {
+        if (queueSub != null) {
+            int total = picked.size(), done = 0;
+            for (String p : picked) if ("完成".equals(stateOf(p))) done++;
+            queueSub.setText("共 " + total + " 个 · 完成 " + done
+                    + (queueSel.isEmpty() ? "" : " · 已选 " + queueSel.size()));
+        }
+        // 让定时刷新认为“没变化”，别在用户操作期间重建行
+        queueSig = queueSignature();
+    }
+
+    private float swipeStartX = 0f;
+    private long queueTouchAt = 0L;
+    private String queueSig = null;
+
+    /** 队列状态的轻量指纹：没变化就不用重建行。 */
+    private String queueSignature() {
+        StringBuilder sb = new StringBuilder();
+        sb.append(picked.size()).append('|').append(queueSel.size()).append('|')
+                .append(curFile).append('|').append((int) (fileProgress * 40)).append('|');
+        for (String p : picked) sb.append(stateOf(p)).append(',');
+        return sb.toString();
+    }
+
+    private void refreshQueueIfChanged() {
+        String sig = queueSignature();
+        if (sig.equals(queueSig)) return;
+        refreshQueue();
+    }
+
+    private float rv_width() {
+        return getResources().getDisplayMetrics().widthPixels;
+    }
+
+    private void flingRemove(final String path, final View row) {
+        row.animate().translationX(-rv_width())
+                .alpha(0f).setDuration(180L)
+                .withEndAction(() -> {
+                    if (removeFromQueue(path, true)) {
+                        refreshQueue();
+                        refreshFiles();
+                    }
+                }).start();
+    }
+
+    /** 从队列移除一条；正在处理的那个不动。 */
+    private boolean removeFromQueue(String path, boolean log) {
+        if (!picked.contains(path)) return false;
+        if (busy && path.equals(curFile)) {
+            toast("这个正在处理，先点「停止」再移除");
+            return false;
+        }
+        picked.remove(path);
+        fileState.remove(path);
+        queueSel.remove(path);
+        if (log) appendLog("已从队列移除：" + new File(path).getName());
+        return true;
+    }
+
+    private String stateOf(String path) {
+        String s = fileState.get(path);
+        return s == null ? "待处理" : s;
+    }
+
+    private String percentText(String st, boolean cur) {
+        if (cur) {
+            int pct = Math.round(Math.max(0f, Math.min(1f, fileProgress)) * 100f);
+            return "处理中 " + pct + "%";
+        }
+        return st;
+    }
+
+    private int stateColor(String st, boolean cur) {
+        if (cur || "处理中".equals(st)) return ACCENT;
+        if ("完成".equals(st)) return OK_GREEN;
+        if ("失败".equals(st)) return WARN;
+        return INK3;
+    }
+
+    // ── 所有文件访问（字幕写回原片旁边要用）───────────────────
+    private boolean hasAllFiles() {
+        if (Build.VERSION.SDK_INT >= 30) {
+            try {
+                return Environment.isExternalStorageManager();
+            } catch (Exception e) {
+                return false;
+            }
+        }
+        try {
+            return checkSelfPermission(android.Manifest.permission.WRITE_EXTERNAL_STORAGE)
+                    == PackageManager.PERMISSION_GRANTED;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    /** 没授权时引导一次；不拦着用，只是字幕改放 App 的 output 目录。 */
+    private void ensureAllFilesAccess() {
+        if (hasAllFiles() || askedAllFiles) return;
+        askedAllFiles = true;
+        if (Build.VERSION.SDK_INT >= 30) {
+            new android.app.AlertDialog.Builder(this)
+                    .setTitle("需要「所有文件访问」")
+                    .setMessage("授予后，生成的 .srt / .lrc 会直接写回原视频旁边。\n"
+                            + "不授权也能正常用，字幕会放在 App 自己的 output 目录。")
+                    .setPositiveButton("去授权", (d, w) -> {
+                        try {
+                            startActivity(new Intent(
+                                    android.provider.Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
+                                    Uri.parse("package:" + getPackageName())));
+                        } catch (Exception e) {
+                            try {
+                                startActivity(new Intent(
+                                        android.provider.Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION));
+                            } catch (Exception ignored) {
+                            }
+                        }
+                    })
+                    .setNegativeButton("暂不", null)
+                    .show();
+        } else {
+            try {
+                requestPermissions(new String[]{android.Manifest.permission.WRITE_EXTERNAL_STORAGE}, 1003);
+            } catch (Exception ignored) {
+            }
+        }
     }
 
     /** 使用说明弹层：自绘卡片，配色/圆角与主界面一致。 */
@@ -527,17 +973,21 @@ public class MainActivity extends Activity {
                 + "【放片子】\n"
                 + "点「添加文件」选视频或音频（mp4 / mkv / wmv / mp3 / wav 都行），\n"
                 + "或者用数据线拷进 input 目录，重开 App 会自动扫出来。\n\n"
+                + "【队列】\n"
+                + "从屏幕左边缘往右划，打开整屏队列：上下滑动看全部任务，\n"
+                + "长按选中，选中后往左划即从队列移除。\n\n"
                 + "【开始处理】\n"
                 + "点「开始处理」后四步全自动，不用管：\n"
                 + "　1/4 提取音频　2/4 起翻译服务\n"
                 + "　3/4 语音识别　4/4 翻译并写字幕\n"
                 + "切到别的 App 也会继续跑，进度会显示在通知栏。\n\n"
                 + "【拿字幕】\n"
-                + "处理完的字幕在 output 目录，每个片子生成\n"
+                + "字幕直接写在原片所在文件夹（首次会让你授予「所有文件访问」；\n"
+                + "没授权就放在 App 的 output 目录）。每个片子生成\n"
                 + "　<原文件名>.chs.srt　（播放器外挂字幕）\n"
                 + "　<原文件名>.chs.lrc　（音乐播放器逐行歌词）\n"
                 + "和视频放一起，用播放器加载就能看。\n"
-                + "（三个目录都在 Android/data/com.nihonsubs/files 下）\n\n"
+                + "（App 自己的目录都在 Android/data/com.nihonsubs/files 下）\n\n"
                 + "【耗时参考】\n"
                 + "90 秒的片子约 31 秒；16 分钟约 6~7 分钟；91 分钟约 12 分钟。\n"
                 + "全程离线，不联网。\n\n"
@@ -687,6 +1137,7 @@ public class MainActivity extends Activity {
 
     // ── 文件选择 ─────────────────────────────────────────
     private void pickFiles() {
+        if (!hasAllFiles()) ensureAllFilesAccess();
         selSet.clear();
         Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT);
         i.addCategory(Intent.CATEGORY_OPENABLE);
@@ -733,8 +1184,17 @@ public class MainActivity extends Activity {
         if (path != null && !picked.contains(path)) picked.add(path);
     }
 
-    /** 从 content:// 反查真实路径；查不到就把文件复制到 app 缓存。 */
+    /**
+     * content:// → 队列里用的路径。
+     * 有「所有文件访问」时优先用原文件真实路径（这样字幕能写回原片旁边，也不用复制几个 G）；
+     * 拿不到真实路径再退回老办法：复制进 App 的 input 目录。
+     */
     private String uriToPath(Uri uri) {
+        String real = realPathOf(uri);
+        if (real != null) {
+            File f = new File(real);
+            if (f.isFile() && f.canRead() && hasAllFiles()) return f.getAbsolutePath();
+        }
         try (Cursor c = getContentResolver().query(uri, null, null, null, null)) {
             if (c != null && c.moveToFirst()) {
                 int idx = c.getColumnIndex(OpenableColumns.DISPLAY_NAME);
@@ -748,6 +1208,46 @@ public class MainActivity extends Activity {
                         while ((r = in.read(buf)) > 0) out.write(buf, 0, r);
                     }
                     return dst.getAbsolutePath();
+                }
+            }
+        } catch (Exception ignored) {
+        }
+        return null;
+    }
+
+    /** content:// 反查真实路径。只认外部存储提供者的几种 id 形态，认不出返回 null。 */
+    private String realPathOf(Uri uri) {
+        try {
+            String id = null;
+            try {
+                id = DocumentsContract.getDocumentId(uri);
+            } catch (Exception ignored) {
+            }
+            if (id != null) {
+                if (id.startsWith("raw:")) return id.substring(4);
+                int colon = id.indexOf(':');
+                if (colon > 0) {
+                    String vol = id.substring(0, colon);
+                    String rel = id.substring(colon + 1);
+                    if ("primary".equalsIgnoreCase(vol)) return "/storage/emulated/0/" + rel;
+                    if ("home".equalsIgnoreCase(vol)) return "/storage/emulated/0/Documents/" + rel;
+                    if (vol.matches("[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}")) return "/storage/" + vol + "/" + rel;
+                }
+                if (id.startsWith("msf:")) {
+                    try (Cursor c = getContentResolver().query(
+                            MediaStore.Files.getContentUri("external"),
+                            new String[]{MediaStore.MediaColumns.DATA},
+                            MediaStore.MediaColumns._ID + "=?",
+                            new String[]{id.substring(4)}, null)) {
+                        if (c != null && c.moveToFirst()) return c.getString(0);
+                    }
+                }
+            }
+            try (Cursor c = getContentResolver().query(uri,
+                    new String[]{MediaStore.MediaColumns.DATA}, null, null, null)) {
+                if (c != null && c.moveToFirst()) {
+                    String p = c.getString(0);
+                    if (p != null && !p.isEmpty()) return p;
                 }
             }
         } catch (Exception ignored) {
@@ -814,17 +1314,15 @@ public class MainActivity extends Activity {
             row.addView(name, new LinearLayout.LayoutParams(0,
                     ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
 
-            if (k < fileState.size()) {
-                String st = fileState.get(k);
-                int col = "完成".equals(st) ? OK_GREEN
-                        : ("失败".equals(st) ? WARN
-                        : ("处理中".equals(st) ? ACCENT : INK3));
-                TextView state = label(st, col, 11f);
-                LinearLayout.LayoutParams slp = new LinearLayout.LayoutParams(
-                        ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-                slp.leftMargin = (int) dp(4);
-                row.addView(state, slp);
-            }
+            String st = stateOf(p);
+            int col = "完成".equals(st) ? OK_GREEN
+                    : ("失败".equals(st) ? WARN
+                    : ("处理中".equals(st) ? ACCENT : INK3));
+            TextView state = label(st, col, 11f);
+            LinearLayout.LayoutParams slp = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            slp.leftMargin = (int) dp(4);
+            row.addView(state, slp);
 
             final String path = p;
             final LinearLayout r = row;
@@ -935,7 +1433,7 @@ public class MainActivity extends Activity {
         curIdx = 0;
         fileProgress = 0f;
         fileState.clear();
-        for (int i = 0; i < picked.size(); i++) fileState.add("待处理");
+        for (String p : picked) fileState.put(p, "待处理");
         refreshFiles();
         setProgress(0f, true);
         setStage("当前阶段　准备中");
@@ -1220,23 +1718,33 @@ public class MainActivity extends Activity {
                 if (stopping) break;
                 final int fi = idx;
                 curIdx = fi;
+                curFile = file;
                 fileProgress = 0f;
+                fileState.put(file, "处理中");
                 ui.post(() -> {
-                    if (fi < fileState.size()) fileState.set(fi, "处理中");
                     refreshFiles();
+                    refreshQueue();
                     setStage("当前阶段　第 " + (fi + 1) + "/" + snapshot.size() + " 个");
                 });
                 appendLog("=== 开始处理：" + new File(file).getName() + " ===");
                 String stem = new File(file).getName();
                 int dot = stem.lastIndexOf('.');
                 if (dot > 0) stem = stem.substring(0, dot);
-                File outSrt = new File(outputDir(), stem + ".chs.srt");
+                // 字幕默认写到原片所在文件夹（需要「所有文件访问」授权）；
+                // 没授权或原目录不可写时退回 App 自己的 output 目录。
+                File srcDir = new File(file).getParentFile();
+                File outDir = (hasAllFiles() && srcDir != null && srcDir.canWrite())
+                        ? srcDir : outputDir();
+                File outSrt = new File(outDir, stem + ".chs.srt");
+                String outKey = outDir.getAbsolutePath() + "/" + outSrt.getName();
                 int dup = 2;
-                while (usedOut.contains(outSrt.getName())) {
-                    outSrt = new File(outputDir(), stem + "-" + dup + ".chs.srt");
+                while (usedOut.contains(outKey)) {
+                    outSrt = new File(outDir, stem + "-" + dup + ".chs.srt");
+                    outKey = outDir.getAbsolutePath() + "/" + outSrt.getName();
                     dup++;
                 }
-                usedOut.add(outSrt.getName());
+                usedOut.add(outKey);
+                appendLog("[输出] 字幕将写入：" + outDir.getAbsolutePath());
                 // 音频提取交给 run.sh 里的 ffmpeg。
                 // 原方案是先用系统 MediaCodec 解码再喂给脚本（为了只带 ffmpeg 当兜底），
                 // 实测 90 秒音频要 2.8 秒、91 分钟片子要 2.9 分钟，而 ffmpeg 只要约 30 秒 —— 慢 5.7 倍，
@@ -1261,9 +1769,10 @@ public class MainActivity extends Activity {
                 running = null;
                 final boolean ok = (code == 0);
                 final String state = stopping ? "已停止" : (ok ? "完成" : "失败");
+                fileState.put(file, state);
                 ui.post(() -> {
-                    if (fi < fileState.size()) fileState.set(fi, state);
                     refreshFiles();
+                    refreshQueue();
                 });
                 appendLog("[结束] 退出码 " + code + "（" + state + "）");
                 idx++;
@@ -1323,7 +1832,7 @@ public class MainActivity extends Activity {
         stopBtn.setEnabled(false);
         stopBtn.setAlpha(0.4f);
         int done = 0;
-        for (String st : fileState) {
+        for (String st : fileState.values()) {
             if ("完成".equals(st)) done++;
         }
         int total = picked.size();

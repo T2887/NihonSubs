@@ -1,7 +1,9 @@
 # NihonSubs 最新版本（App 版本自检读取本文件）
 # 格式：VERSION=<语义版本号> APK=<下载地址> NOTE=<更新说明（可空）>
 # MODEL_URL=<模型包下载页；缺模型时 App 弹窗「去下载」打开它。换网盘只改这一行，不必重打包>
-VERSION=1.1.1
-APK=https://github.com/T2887/NihonSubs/releases/download/v1.1.1/NihonSubs-v1.1.1.apk
-MODEL_URL=https://pan.baidu.com/s/1UrvC4AaxsV-BBJWOrTNUdg?pwd=c82t
-NOTE=v1.1.1：模型包支持 zipformer-ja 可选增强（一个 zip 全装好）；未导入模型时会弹窗直接跳转下载页。
+# MODEL_CODE=<网盘提取码（可空）；有值时弹窗会显示并复制到剪贴板>
+VERSION=1.1.2
+APK=https://github.com/T2887/NihonSubs/releases/download/v1.1.2/NihonSubs-v1.1.2.apk
+MODEL_URL=https://pan.quark.cn/s/42530f352af0
+MODEL_CODE=GHXq
+NOTE=v1.1.2：缺模型弹窗改用夸克网盘并显示提取码（点下载自动复制）；备用百度网盘 https://pan.baidu.com/s/1UrvC4AaxsV-BBJWOrTNUdg?pwd=c82t 提取码 c82t；模型包与 APK 两个网盘里都有。

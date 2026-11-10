@@ -108,6 +108,8 @@ public class MainActivity extends Activity {
     private String pendingModelName = null;
     /** 线上模型包下载地址（latest.txt 里的 MODEL_URL，换网盘只改这个文件即可） */
     private String remoteModelUrl = null;
+    /** 网盘提取码（latest.txt 里的 MODEL_CODE，可空） */
+    private String remoteModelCode = null;
     private int curIdx = 0;
     private float fileProgress = 0f;
     private volatile boolean stopping = false;
@@ -1527,6 +1529,7 @@ public class MainActivity extends Activity {
             else if (line.regionMatches(true, 0, "APK=", 0, 4)) apkUrl = line.substring(4).trim();
             else if (line.regionMatches(true, 0, "NOTE=", 0, 5)) note = line.substring(5).trim();
             else if (line.regionMatches(true, 0, "MODEL_URL=", 0, 10)) remoteModelUrl = line.substring(10).trim();
+            else if (line.regionMatches(true, 0, "MODEL_CODE=", 0, 11)) remoteModelCode = line.substring(11).trim();
             else if (remoteVer == null && !line.contains("=")) remoteVer = line; // 裸版本号
             else if (apkUrl == null && (line.startsWith("http"))) apkUrl = line;
         }
@@ -1591,7 +1594,7 @@ public class MainActivity extends Activity {
             return;
         }
         Thread t = new Thread(() -> {
-            String url = null;
+            String url = null, code = null;
             for (String base : new String[]{VERSION_URL, VERSION_URL_BACKUP}) {
                 try {
                     String raw = httpGetLong(base);
@@ -1600,16 +1603,18 @@ public class MainActivity extends Activity {
                         line = line.trim();
                         if (line.regionMatches(true, 0, "MODEL_URL=", 0, 10)) {
                             url = line.substring(10).trim();
-                            break;
+                        } else if (line.regionMatches(true, 0, "MODEL_CODE=", 0, 11)) {
+                            code = line.substring(11).trim();
                         }
                     }
                     if (url != null && !url.isEmpty()) break;
                 } catch (Exception ignored) { }
             }
-            final String u = url;
+            final String u = url, c = code;
             ui.post(() -> {
                 if (u != null && !u.isEmpty()) {
                     remoteModelUrl = u;
+                    remoteModelCode = c;
                     showModelDlDialog(u);
                 } else {
                     startModelImport();   // 取不到线上地址就退回本地导入
@@ -1620,12 +1625,30 @@ public class MainActivity extends Activity {
         t.start();
     }
 
+    /** 复制文本到剪贴板（提取码用）。 */
+    private void copyText(final String s, final String tip) {
+        try {
+            android.content.ClipboardManager cm = (android.content.ClipboardManager)
+                    getSystemService(android.content.Context.CLIPBOARD_SERVICE);
+            cm.setPrimaryClip(android.content.ClipData.newPlainText("nihonsubs", s));
+            if (tip != null) toast(tip);
+        } catch (Exception ignored) { }
+    }
+
     private void showModelDlDialog(final String url) {
         android.app.AlertDialog.Builder b = new android.app.AlertDialog.Builder(this);
         b.setTitle("需要先下载模型");
+        final String code = remoteModelCode;
+        boolean hasCode = code != null && !code.isEmpty();
         b.setMessage("首次使用需要模型包 asmr-models.zip（约 1.5 GB）。\n\n"
-                + "点「去下载」用浏览器打开下载页；下载好后回到 App 选这个 zip，会自动解压安装。");
-        b.setPositiveButton("去下载", (d, w) -> { d.dismiss(); openUrl(url); });
+                + "点「去下载」用浏览器打开下载页"
+                + (hasCode ? "，提取码：" + code + "（点下载会自动复制）" : "")
+                + "；下载好后回到 App 选这个 zip，会自动解压安装。");
+        b.setPositiveButton("去下载", (d, w) -> {
+            d.dismiss();
+            if (hasCode) copyText(code, "提取码 " + code + " 已复制");
+            openUrl(url);
+        });
         b.setNeutralButton("已下载，去导入", (d, w) -> { d.dismiss(); startModelImport(); });
         b.setNegativeButton("取消", (d, w) -> d.dismiss());
         try { b.show(); } catch (Exception ignored) { }

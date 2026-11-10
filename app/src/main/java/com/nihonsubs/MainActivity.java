@@ -1058,15 +1058,16 @@ public class MainActivity extends Activity {
         }
         final String target;      // 落盘用的文件名
         final boolean zipf;       // 是否放进 zipformer-ja/
+        // 兼容两种命名：短名 encoder.int8.onnx，以及原始训练名 encoder-epoch-99-avg-1.int8.onnx
         if (lower.endsWith("model.int8.onnx")) {
             target = "model.int8.onnx"; zipf = false;
         } else if (lower.endsWith(".gguf")) {
             target = "hy.gguf"; zipf = false;
-        } else if (lower.endsWith("encoder.int8.onnx")) {
+        } else if (lower.endsWith(".onnx") && lower.contains("encoder")) {
             target = "encoder.int8.onnx"; zipf = true;
-        } else if (lower.endsWith("decoder.onnx")) {
+        } else if (lower.endsWith(".onnx") && lower.contains("decoder")) {
             target = "decoder.onnx"; zipf = true;
-        } else if (lower.endsWith("joiner.onnx")) {
+        } else if (lower.endsWith(".onnx") && lower.contains("joiner")) {
             target = "joiner.onnx"; zipf = true;
         } else if (lower.endsWith("tokens.txt")) {
             target = "tokens.txt"; zipf = true;

@@ -2,8 +2,8 @@
 # 格式：VERSION=<语义版本号> APK=<下载地址> NOTE=<更新说明（可空）>
 # MODEL_URL=<模型包下载页；缺模型时 App 弹窗「去下载」打开它。换网盘只改这一行，不必重打包>
 # MODEL_CODE=<网盘提取码（可空）；有值时弹窗会显示并复制到剪贴板>
-VERSION=1.1.3
-APK=https://github.com/T2887/NihonSubs/releases/download/v1.1.3/NihonSubs-v1.1.3.apk
+VERSION=1.1.4
+APK=https://github.com/T2887/NihonSubs/releases/download/v1.1.4/NihonSubs-v1.1.4.apk
 MODEL_URL=https://pan.quark.cn/s/42530f352af0
 MODEL_CODE=GHXq
-NOTE=v1.1.3：修复导入模型——按文件名自动归位（先选 hy.gguf 也不会写错），导入按钮不再置灰，可随时补装 zipformer-ja；新增识别模型体积异常提示。备用百度网盘 https://pan.baidu.com/s/1UrvC4AaxsV-BBJWOrTNUdg?pwd=c82t 提取码 c82t。
+NOTE=v1.1.4：导入模型按文件名自动归位（顺序随意，encoder-epoch-99 这类原始文件名也认），导入按钮不再置灰，可随时补装 zipformer-ja，并提示识别模型体积异常。备用百度网盘 https://pan.baidu.com/s/1UrvC4AaxsV-BBJWOrTNUdg?pwd=c82t 提取码 c82t。

@@ -80,7 +80,7 @@ public class MainActivity extends Activity {
     private static final String VERSION_URL =
             "https://raw.githubusercontent.com/T2887/NihonSubs/main/latest.txt";
     private static final String VERSION_URL_BACKUP =
-            "https://gitee.com/T2887/NihonSubs/raw/main/latest.txt";
+            "https://gitee.com/aaa15/NihonSubs/raw/main/latest.txt";
     private TextView updateRowView;   // 「检查更新」按钮（查到新版可变色提示）
 
     private final Handler ui = new Handler(Looper.getMainLooper());

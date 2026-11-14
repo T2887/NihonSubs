@@ -333,8 +333,16 @@ server_alive() {
 start_llama() {
     cd "$LLAMA_DIR" || exit 1
     rm -f "$LLAMA_DIR/llama.log"
+    # ASMR 风格 LoRA：直接打进 APK，装完就有，用户不用额外下载。
+    # 实测（K30U，200 句 A/B）：质量高 3.25 个点，单句慢 14~17%（1.2s → 1.4s），
+    # 远低于 PC 端的 2.4 倍 —— 因为层权重走的是 CPU 回退路径，本来就没占什么便宜。
+    LORA="$W/hy-mt2-asmr-lora.gguf"
+    LORA_ARGS=""
+    if [ -f "$LORA" ]; then
+        LORA_ARGS="--lora $LORA"
+    fi
     nohup $NICE $TASKSET "$BIN_LLAMA" --model "$MODEL_DIR/hy.gguf" \
-        --host 127.0.0.1 --port $PORT -c 4096 -np 1 \
+        --host 127.0.0.1 --port $PORT -c 4096 -np 1 $LORA_ARGS \
         --no-webui --metrics -t $THREADS \
         > "$LLAMA_DIR/llama.log" 2>&1 < /dev/null &
     # 就绪判据：端口能应答 /health。

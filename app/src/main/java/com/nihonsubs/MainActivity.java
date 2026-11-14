@@ -303,6 +303,25 @@ public class MainActivity extends Activity {
         ui.postDelayed(this::ensureAllFilesAccess, 1200);
         // 上次队列没跑完（App 被系统杀掉 / 崩溃 / 手滑退出）→ 问要不要接着跑
         ui.postDelayed(this::promptResumeQueue, 1600);
+        // Android 13+ 必须拿到通知权限，前台服务才发得出通知；
+        // 发不出通知 → 系统不认这个前台服务 → 进程被归入 background cgroup，
+        // 推理只能跑小核、还只给 1/4 CPU 权重（平板实测慢 20 倍）。
+        ui.postDelayed(this::ensureNotifPermission, 700);
+    }
+
+    /**
+     * 申请通知权限（Android 13/API 33 起是运行时权限）。
+     * 被拒也能跑，只是慢：KeepAliveService 的前台通知发不出去，
+     * 系统就把进程当普通后台，绑到小核 + 降 CPU 权重。
+     */
+    private void ensureNotifPermission() {
+        if (Build.VERSION.SDK_INT < 33) return;
+        try {
+            if (checkSelfPermission("android.permission.POST_NOTIFICATIONS")
+                    == PackageManager.PERMISSION_GRANTED) return;
+            requestPermissions(new String[]{"android.permission.POST_NOTIFICATIONS"}, 1004);
+        } catch (Exception ignored) {
+        }
     }
 
     /** 启动时扫一遍 input 目录：从电脑拷进来的文件不用再手动选。 */
@@ -1988,7 +2007,7 @@ public class MainActivity extends Activity {
     private void extractAssets() throws Exception {
         File bin = binDir();
         // 可执行文件都在 nativeLibraryDir（lib/arm64-v8a），这里只解压数据文件
-        String[] names = {"run.sh", "silero_vad.onnx", "tokens.txt"};
+        String[] names = {"run.sh", "silero_vad.onnx", "tokens.txt", "hy-mt2-asmr-lora.gguf"};
         for (String n : names) {
             File out = new File(bin, n);
             try (InputStream in = getAssets().open(n);
@@ -2004,13 +2023,14 @@ public class MainActivity extends Activity {
     }
 
     /** assets 里的 run.sh 有改动时 +1，老设备靠这个戳记重新解压。 */
-    private static final String ASSETS_VER = "v18";
+    private static final String ASSETS_VER = "v19";
 
     private boolean binReady() {
         return new File(binDir(), ".assets_" + ASSETS_VER).isFile()
                 && new File(binDir(), "run.sh").isFile()
                 && new File(binDir(), "silero_vad.onnx").isFile()
-                && new File(binDir(), "tokens.txt").isFile();
+                && new File(binDir(), "tokens.txt").isFile()
+                && new File(binDir(), "hy-mt2-asmr-lora.gguf").isFile();
     }
 
     // ── 执行 ─────────────────────────────────────────────
@@ -2970,6 +2990,7 @@ public class MainActivity extends Activity {
 
     /** 最近一轮三条数据源各自的成功情况，只进 logcat，不上界面。 */
     private String lastMetricErr = "-", lastProcErr = "-", lastFreqOk = "-";
+    private boolean throttleWarned = false;   // 限流提示只说一次
 
     private String collectStats() throws Exception {
         StringBuilder sb = new StringBuilder();
@@ -3137,7 +3158,34 @@ public class MainActivity extends Activity {
         } else {
             lastFreqOk = "none";
         }
+        // ④ 被系统限流的探测：MIUI/澎湃会把没拿到前台身份的进程塞进 background cgroup，
+        //    那里只允许小核（实测 0-3）且 CPU 权重只有 1/4，同样一个片子能慢 20 倍。
+        if (busy) {
+            long pid = sherpaPid > 0 ? sherpaPid : llamaPid;
+            if (pid > 0 && isThrottled(pid)) {
+                sb.append("（系统限制中）");
+                if (!throttleWarned) {
+                    throttleWarned = true;
+                    ui.post(() -> appendLog("[提示] 系统把本应用当成后台程序，只给了小核，速度会慢很多。"
+                            + "请允许通知，并在省电设置里把本应用设为「无限制」。"));
+                }
+            }
+        }
         return sb.length() > 0 ? sb.toString() : STATS_IDLE;
+    }
+
+    /** 该进程是否被关进 background cgroup（只给小核 + 低权重）。 */
+    private static boolean isThrottled(long pid) {
+        try (java.io.BufferedReader br = new java.io.BufferedReader(new java.io.InputStreamReader(
+                new FileInputStream("/proc/" + pid + "/cgroup"), "UTF-8"))) {
+            String line;
+            while ((line = br.readLine()) != null) {
+                if (line.contains("cpu:") && line.contains("/background")) return true;
+                if (line.contains("cpuset:") && line.contains("/background")) return true;
+            }
+        } catch (Exception ignored) {
+        }
+        return false;
     }
 
     /** Prometheus 文本里找 "llamacpp:<name> <value>" 行（精确匹配行尾名称，避免 cached_total 误中）。 */

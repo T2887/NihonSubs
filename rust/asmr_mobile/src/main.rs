@@ -37,7 +37,7 @@ const SYSTEM: &str = "你是日译中字幕翻译。把用户给的日语翻译�
 示例：\n\
 日语：今日はいい天気ですね\n中文：今天天气真不错呢\n\
 日语：ちょっと待ってください\n中文：请稍等一下\n\
-日语：そろそろ帰りましょうか\n中文：差不多该回去了吧";
+日语：そろそろ帰りましょうか\n中文：差不多该回去了吧\n\n术语统一用：肉棒、小穴、高潮、精液、射精、口交、乳交、摩擦、抽插、乳头、耳朵、屁股、按摩\n\n拟声词（ぺろ/ちゅ/れろ/咕啾类）要译成对应的中文音效词（如 舔弄声、啾、咕啾、咻、噗嗤），\n不要译成「好可爱」「舒服」这类评价词；同一个拟声词在不同句子可以有不同的中文写法，\n不要每句都用同一个词。";
 
 /// 句末停顿超过这个秒数就断句。
 const GAP_SPLIT: f64 = 0.55;
@@ -612,6 +612,17 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].text, "あいさつです");
     }
+
+    #[test]
+    fn trim_runaway_cuts_loops() {
+        let loop1 = "啊啊~ 要高潮了~ 要高潮了~ 要高潮了~ 要高潮了~ 要高潮了~ 要高潮了~ 要高潮了~ 要高潮了~";
+        assert!(trim_runaway(loop1).chars().count() < 30);
+        let loop2 = "咻咻咻咻咻咻咻咻咻咻咻咻咻咻咻咻咻咻咻咻咻咻咻咻咻咻咻咻咻咻咻咻";
+        assert!(trim_runaway(loop2).chars().count() < 40);
+        let ok = "搞混了的话就会变成四十、五十摄氏度，那样就很危险了，一定要注意温度才行";
+        assert_eq!(trim_runaway(ok), ok);
+        assert_eq!(trim_runaway("好可爱"), "好可爱");
+    }
 }
 
 fn fmt_ts(sec: f64) -> String {
@@ -648,6 +659,41 @@ fn lrc_out_path(srt_path: &str) -> String {
     }
 }
 
+/// LoRA 偶发复读（实测 200 句里有 2 句：「要高潮了~ 要高潮了~ …」「咻咻咻…」到 320 token 上限）。
+/// 两步兜底：①2~8 字片段连续重复 ≥4 次就截到第一次出现；②超长（>80 字）回退到最后一个标点。
+/// 正常字幕很少超过 40 字，所以先按长度门槛短路，避免误伤「哈哈哈」这类正常重复。
+fn trim_runaway(s: &str) -> String {
+    let ch: Vec<char> = s.chars().collect();
+    if ch.len() <= 40 {
+        return s.to_string();
+    }
+    let n = ch.len();
+    for w in 2..=8usize {
+        let mut i = 0usize;
+        while i + w * 4 <= n {
+            let mut reps = 1usize;
+            while i + w * (reps + 1) <= n && ch[i + w * reps..i + w * (reps + 1)] == ch[i..i + w] {
+                reps += 1;
+            }
+            if reps >= 4 {
+                let out: String = ch[..i + w].iter().collect();
+                return out.trim_end().to_string();
+            }
+            i += 1;
+        }
+    }
+    if ch.len() > 80 {
+        let head: String = ch[..80].iter().collect();
+        if let Some(pos) = head.rfind(['。', '！', '？', '，', '、', '~', ' ']) {
+            if pos >= 8 {
+                return head[..pos].trim_end().to_string();
+            }
+        }
+        return head.trim_end().to_string();
+    }
+    s.to_string()
+}
+
 /// 对 127.0.0.1:port 发一次 /v1/chat/completions，返回 content。
 fn translate(port: u16, text: &str, temp: f64) -> Result<String, String> {
     let body = json!({
@@ -656,7 +702,11 @@ fn translate(port: u16, text: &str, temp: f64) -> Result<String, String> {
             {"role": "user", "content": text}
         ],
         "temperature": temp,
-        "max_tokens": 128,
+        // PC 版 v1.28.5 的教训：128 会把长句硬截断，且截断后译文不为空、最难发现。
+        "max_tokens": 320,
+        // LoRA 的回合结束符是 hy 模板私有 token，采样器有时不认，会漏出 <|hy_ 或全角变体。
+        // 没挂 LoRA 时这两个串不会出现，属于纯兜底。
+        "stop": ["<|hy_", "＜｜"],
         "stream": false
     })
     .to_string();
@@ -698,7 +748,15 @@ fn translate(port: u16, text: &str, temp: f64) -> Result<String, String> {
         .as_str()
         .ok_or_else(|| "响应里没有 choices[0].message.content".to_string())?;
     // SRT 一条字幕里不能有换行，多行会被播放器当成两条
-    Ok(content.trim().replace('\n', " ").replace('\r', ""))
+    let mut out = content.trim().replace('\n', " ").replace('\r', "");
+    // 控制符兜底：stop 只能拦住 "%s"，全角变体 "＜｜" 有时能绕过采样器。
+    // 日译中字幕里 "<" / "＜" 之后绝不会是正文，从第一个出现处整段切掉。
+    if let Some(p) = out.find(['<', '＜']) {
+        out.truncate(p);
+        out = out.trim_end().to_string();
+    }
+    out = trim_runaway(&out);
+    Ok(out)
 }
 
 /// 一句翻译的重试封装。照 PC 版 v1.28.5 的教训：
@@ -990,4 +1048,7 @@ fn main() {
     if failed > 0 && failed == segs.len() {
         exit(1);
     }
+
+
+
 }
